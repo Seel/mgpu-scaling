@@ -6,6 +6,51 @@ Handoff for a fresh session. Read this first; it assumes no memory of the previo
 > lived in `fo4-fg-gpu1/`. It is now `Seel/mgpu-scaling`, with the same files at the root. Absolute
 > paths below (`D:\fgb`, `D:\fgh`, old `fo4-fg-gpu1\...` references) are kept as written.
 
+## Windows 11 (2026-11-09): the game crashed at start; GPU roles came out inverted
+
+After the Win10 → Win11 upgrade every start crashed about a second after `[Frame Generation]
+Creating resources`: 7 crash dumps (2026-11-08 21:57-23:58, `%LOCALAPPDATA%\CrashDumps`; WER
+LocalDumps is on), both the 01:43 `D:\fgh` build made on Win10 and the Win11 rebuild in `D:\fgb`.
+All 7: unhandled `DX::com_exception` 0x887A0005 (`DXGI_ERROR_DEVICE_REMOVED`) from
+`OpenSharedHandle` on the interop device, `Upscaling::CreateFrameGenerationResources`
+(Upscaling.cpp:359), called from the first `DX12SwapChain::Present`. Decoded without a debugger
+(none installed): a stdlib Python minidump reader plus `llvm-symbolizer --relative-address` from the
+MSVC bin folder with the build's PDB.
+
+Cause: the user's Win11 has the RTX 3090 as the default high-performance GPU
+(`HKCU\Software\Microsoft\DirectX\UserGpuPreferences`: `HighPerfAdapter=10DE&2204&...`) and
+Fallout4.exe set to High performance. Win10 ignored that for Fallout 4; Win11 follows it, **and
+inside the game process DXGI lists the monitor under the preferred GPU**: the log had
+`"\\.\DISPLAY5"` under the 3090 and 0 outputs on the 9060 XT, which the cable is in (WMI and
+`QueryDisplayConfig` agree: DISPLAY5 → LUID 0x000191ce, the 9060). `PickRenderAdapter` /
+`SelectSecondaryAdapter` went by DXGI outputs, so: "the game picked the display GPU; rendering on 9060
+instead", FG + present on the 3090 (`[FSR]` offered only 3.1.7 / 3.1.6, FSR 4 upscaler "not offered":
+it asked the NVIDIA card), direct GPU copy in the untested direction, then the device-removed crash.
+All 7 dumps have AMD's D3D11 driver (`amdxx64.dll`) on the render thread, i.e. all were inverted.
+
+Fix (this branch): both functions take "drives a display / the game window's monitor" from the CCD
+display configuration (`ActiveDisplayPaths`, `DisplayMap` in CrossAdapterBridge.cpp; the target
+adapter of each active path, its source adapter for indirect displays), falling back to DXGI only
+when CCD names no hardware adapter. Log: `display configuration: "\\.\DISPLAY5" is plugged into
+luid=...`, per-adapter `[DXGI lists the monitor here: GPU preference, ignored]` /
+`[DXGI hides its monitor: ...]`, and `PickRenderAdapter` now says why it moved the game or not. With
+the 3090 preferred the game already starts there and stays (`the game picked "NVIDIA GeForce RTX 3090",
+which drives no display; it renders there ...`). `sSecondaryGPUName` now also steers
+`PickRenderAdapter` (the game is moved off the named GPU), so it is a full manual override; before, a
+game started on the named GPU made `SelectSecondaryAdapter` find nothing.
+
+**Tested in game (user, 2026-11-09 ~00:2x): works both ways**, game started on the 3090 and game
+started on the 9060 (moved to the 3090). Saved log is the 9060 start; numbers and the first
+FSR 4 ML frame generation (4.0.2 + swap chain 4.0.0) are in [NEXT-SESSION.md](NEXT-SESSION.md).
+
+Not done: the device-removed exception itself is still unhandled (only reachable with inverted roles
+so far; why the 9060's interop device was removed then was not established: suspects are the
+reverse-direction direct GPU copy, AMD D3D12 opening NVIDIA ReBAR memory).
+
+User note: with the 9060 as preferred GPU "the framerate was abysmal" (2026-11-09, before the fix;
+not known whether that run had the mod). With the fix, the 9060-start run gave 63.7-66.3 game fps, so
+the mod moves rendering to the 3090 correctly there; the slow run was most likely the game on the 9060.
+
 ## TODO for the next session (written 2026-11-08 ~01:00, updated 2026-11-08 01:36)
 
 1. ~~**Check the PC first.**~~ **Done.** RAM back at 3800 MT/s since the 01:01 boot.

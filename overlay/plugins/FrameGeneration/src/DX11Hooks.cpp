@@ -216,18 +216,18 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 			upscaling->d3d12Interop = true;
 			upscaling->refreshRate = Upscaling::GetRefreshRate(pSwapChainDesc->OutputWindow);
 
-			// Old games enumerate adapters and take the one driving the display. Secondary-GPU
-			// mode needs the opposite: render on the GPU with no display attached, present on
-			// the other. Only the unambiguous two-GPU case is moved.
+			// Old games enumerate adapters and take the one driving the display (on Windows 11, the
+			// one the GPU preference names). Secondary-GPU mode needs the GPU with no display attached
+			// to render and the other to present. Only the unambiguous two-GPU case is moved.
 			IDXGIAdapter* deviceAdapter = pAdapter;
 			D3D_DRIVER_TYPE deviceDriverType = DriverType;
 			winrt::com_ptr<IDXGIAdapter1> renderPick;
 			if (useSecondaryGPU) {
-				renderPick = CrossAdapterBridge::PickRenderAdapter(pAdapter);
+				renderPick = CrossAdapterBridge::PickRenderAdapter(pAdapter, upscaling->settings.secondaryGPUName);
 				if (renderPick) {
 					deviceAdapter = renderPick.get();
 					deviceDriverType = D3D_DRIVER_TYPE_UNKNOWN;  // required with an explicit adapter
-					REX::INFO("[FG-GPU1] the game picked the display GPU; rendering on \"{}\" instead",
+					REX::INFO("[FG-GPU1] rendering on \"{}\" instead of the game's pick",
 						CrossAdapterBridge::AdapterName(deviceAdapter));
 				}
 			}

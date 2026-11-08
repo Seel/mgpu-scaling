@@ -1,4 +1,30 @@
-# Next session: start here (written 2026-11-08 ~01:50)
+# Next session: start here
+
+## Windows 11 GPU-role fix: works in game (2026-11-09)
+
+On Windows 11 the game crashed at start because the Windows GPU preference (3090 preferred) makes
+DXGI list the monitor under the 3090, and the plugin inverted the roles. Fixed by reading the display
+configuration (`QueryDisplayConfig`) instead; details in the first section of
+[SESSION-NOTES.md](SESSION-NOTES.md). Build: `D:\fgb\MGPU-Scaling.zip` (2026-11-09 00:19).
+
+The user tested both ways and both work: game started on the 3090 (3090 preferred), and game started
+on the 9060 (moved to the 3090). Only the last run's log was kept (00:23-00:24, the 9060 start):
+`the game picked "AMD Radeon RX 9060 XT", which drives the display` → `rendering on "NVIDIA GeForce
+RTX 3090" instead of the game's pick` → `SELECTED "AMD Radeon RX 9060 XT"`. First Win11 numbers, with
+direct GPU copy, 3 frames in flight, FSR 4.1 Quality, AutoHDR (HDR10):
+- **FSR 4 ML frame generation is now in use:** swap chain 4.0.0 (driver pacing capable) + frame
+  generation 4.0.2, both offered for the first time (Win10 offered only 3.1.6). Image quality and
+  pacing vs 3.1.6 (`iFSRFrameGenProvider = 1`) not compared yet.
+- FSR 4.1.2 upscaler 2560x1440 → 3840x2160, avg 4.38 ms; UI composite 0.41 ms.
+- 63.7 / 66.3 game fps → 127.5 / 132.6 presented, 50% generated (cap 71).
+- Direct copy: every frame, check values never late; copy on the 3090 7.75 ms. Its Vulkan copy into
+  the landing heaps is **1.5-1.6 ms avg** vs 0.48-0.57 ms on Win10: worth a look.
+- Exit clean: `the game is terminating itself; closed the render GPU's views ..., then freed the blocks`.
+
+The 3090-preferred start was not saved; next time keep its log with `tools/save-runs.ps1` to have the
+`which drives no display; it renders there` line and the DXGI-overruled notes on record.
+
+## Earlier (written 2026-11-08 ~01:50)
 
 Branch `ui-tiles` (from main; local, not pushed) became this tree when the repository moved to
 `mgpu-scaling` on 2026-11-08. Read [plans/UI-TILES.md](plans/UI-TILES.md) part 2

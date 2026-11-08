@@ -11,11 +11,26 @@ The upstream frame generation plugin creates its D3D12 device on the game's GPU.
 | render GPU | 3090 (not the monitor) | The game renders here. A **copy queue** copies each frame into cross-adapter heaps. |
 | display GPU | 9060 XT (monitor) | Unpacks the copies, runs FSR3 FG, owns the swap chain and presents. |
 
-The roles are picked automatically, not from a setting. The display GPU is the hardware adapter with
-a display attached (the 9060). Fallout 4 is a 2015 app: it enumerates adapters and takes the display
-one, and the Windows "High performance" GPU preference does not change that. So when the game starts
-on the display GPU, the plugin creates its D3D11 device on the headless GPU (the 3090) instead and
-logs `the game picked the display GPU; rendering on "NVIDIA GeForce RTX 3090" instead`.
+The roles are picked automatically, not from a setting. The display GPU is the one the monitor is
+plugged into (the 9060), read from Windows' display configuration (`QueryDisplayConfig`), which
+names the adapter that scans each monitor out. DXGI's own output list cannot be used for this: on
+Windows 11, a game with a GPU preference (Settings → System → Display → Graphics, or the default
+high-performance GPU chosen there) sees the monitors listed under the preferred GPU, whichever card
+the cable is in. With the 3090 preferred, Fallout 4 saw the monitor under the 3090; the plugin
+used to trust that, put the game on the 9060 and frame generation on the 3090, and the game crashed
+at its first frame (`DXGI_ERROR_DEVICE_REMOVED` while creating the shared buffers).
+
+Fallout 4 renders on whichever GPU Windows prefers for it:
+- **3090 preferred (recommended on Windows 11):** the game starts on the 3090, which drives no
+  display, and stays there: `the game picked "NVIDIA GeForce RTX 3090", which drives no display; it
+  renders there and "AMD Radeon RX 9060 XT" presents`.
+- **9060 preferred, or no preference** (Windows 10 ignored the preference for Fallout 4, so this was
+  always the case there): the game starts on the 9060, and the plugin creates its D3D11 device on the
+  3090 instead: `the game picked "AMD Radeon RX 9060 XT", which drives the display; ...` followed by
+  `rendering on "NVIDIA GeForce RTX 3090" instead of the game's pick`.
+
+If detection ever gets it wrong, `sSecondaryGPUName` (e.g. `9060`) names the GPU that presents; the
+game is then moved off it when it started there.
 
 Each game frame crosses PCIe once, in one direction. The payload is the finished frame, the HUD-less frame, depth and motion vectors (about 4 B/px each; ~133 MB at 4K if the motion-vector target is 4 B/px). Without this mod, Windows already copies the finished frame from the 3090 to the 9060 XT so you can see it. The new copies are HUD-less, depth and motion vectors.
 
@@ -98,7 +113,7 @@ before it does.
 [FrameGeneration]
 bFrameGenerationMode = 1
 bFrameGenOnSecondaryGPU = 1
-sSecondaryGPUName =          ; optional, e.g. 9060 - only needed if auto-selection refuses
+sSecondaryGPUName =          ; optional, e.g. 9060: the GPU that presents; the game renders on the other. Only if auto-selection refuses or is wrong
 bSendHudlessFrame = 1        ; 1 = extra UI-free copy (clean HUD); 0 = ~25% less PCIe, HUD smears
 bAsyncUnpack = 1             ; 1 = 9060 reads on a copy queue, lane by lane (default); 0 = original serial path
 bEarlyTransfer = 1           ; 1 = depth/MVs/HUD-less cross during the frame (default); 0 = all at Present
@@ -177,17 +192,28 @@ path. If anything in the setup fails, the log says so and the plugin uses mode 0
 The log is usually `Documents\My Games\Fallout4\F4SE\MGPUScaling.log` (frame generation and the upscaler write to the same file; the upscaler's lines start with `[UPSCALE]`, `[RES]`, `[HOOK]` and so on). All second-GPU lines start with `[FG-GPU1]`:
 
 ```
-[FG-GPU1] game window monitor 0x10001 "\\.\DISPLAY1"
-[FG-GPU1] adapter[0] "NVIDIA GeForce RTX 3090" ... [game]
-[FG-GPU1]   "NVIDIA GeForce RTX 3090" outputs: 0
-[FG-GPU1] adapter[1] "AMD Radeon RX 9060 XT" ... [game window's monitor] [display]
-[FG-GPU1]   output[0] "\\.\DISPLAY1" attached=1 monitor=0x10001
+[FG-GPU1] "NVIDIA GeForce RTX 3090" drives no display, but DXGI lists a monitor under it for this process (the Windows GPU preference does that); going by the display configuration
+[FG-GPU1] "AMD Radeon RX 9060 XT" drives a display, but DXGI lists no monitor under it for this process (...)
+[FG-GPU1] the game picked "NVIDIA GeForce RTX 3090", which drives no display; it renders there and "AMD Radeon RX 9060 XT" presents
+[FG-GPU1] game renders on "NVIDIA GeForce RTX 3090"
+[FG-GPU1] game window monitor 0x10001 "\\.\DISPLAY5"
+[FG-GPU1] display configuration: "\\.\DISPLAY5" is plugged into luid=0x00000000-0x000191ce
+[FG-GPU1] adapter[0] "NVIDIA GeForce RTX 3090" ... luid=0x00000000-0x000169d3 ... [game] [DXGI lists the monitor here: GPU preference, ignored]
+[FG-GPU1]   output[0] "\\.\DISPLAY5" attached=1 monitor=0x10001
+[FG-GPU1]   "NVIDIA GeForce RTX 3090" outputs: 1
+[FG-GPU1] adapter[1] "AMD Radeon RX 9060 XT" ... luid=0x00000000-0x000191ce ... [game window's monitor] [display] [DXGI hides its monitor: GPU preference, ignored]
+[FG-GPU1]   "AMD Radeon RX 9060 XT" outputs: 0
 [FG-GPU1] SELECTED "AMD Radeon RX 9060 XT" (owns the monitor the game window is on)
 [FG-GPU1] bridge ready: render GPU copy queue -> cross-adapter heap -> display GPU copy queue, lane by lane (bAsyncUnpack=1)
 [FG-GPU1] lane[0] 'final frame' 3840x2160 ... timing=present  lane[1] 'depth' ... timing=world  lane[2] 'motion vectors' ... timing=world  lane[3] 'HUD-less colour' ... timing=hudless
 [FG-GPU1] 38.1 game fps | 126.6 MB/frame = 4.70 GB/s | copy on render GPU avg 10.10 ms max 11.67 ms (~12.24 GB/s link) | submit 0.086 ms | max lag 2 | cpu waits 0
 [FG-GPU1] presented 74.8 fps | game 38.1 fps | generated 49%
 ```
+
+The first lines are what Windows 11 with the 3090 as the preferred GPU prints (written from the code;
+that setup was tested in game, but its log was not kept): the `output[...]` / `outputs:` lines are DXGI's view, which the GPU preference
+rearranges, and the bracketed notes say where it was overruled. Without a GPU preference the two
+views agree and those notes and the first two lines do not appear.
 
 The stats lines repeat every 10 s — the bridge's line and the presented/game line have separate
 timers, so they appear next to each other. Watch these numbers:
@@ -267,8 +293,10 @@ of each unless you pin one:
 | interpolator | **3.1.6** only (analytical, same kind as 3.1.4) | **4.0.2** (FSR 4 ML), or 3.1.6 |
 
 The Windows 10 column was probed before this PC was upgraded to Windows 11; the Windows 11 column is
-AMD's documented behaviour and has not been re-probed on it. The first run after the upgrade should
-show the ML interpolator in `[FSR] frame generation providers offered: ...` if the driver offers it.
+AMD's documented behaviour and has not been re-probed on it. The first runs after the upgrade do not
+count: with the roles inverted (see the top), they asked the 3090 and got `3.1.7` / `3.1.6`. The first
+run with the 9060 presenting (2026-11-09) confirmed the Windows 11 column: `swap chain providers
+offered: 4.0.0, 3.1.7`, `frame generation providers offered: 4.0.2, 3.1.6`, in use 4.0.0 + 4.0.2.
 
 So on Windows 10 the image-quality upgrade (ML frame generation) is **not available**; AMD's runtime
 does not even list it. What 2.4 can still bring there is the 4.0.0 swap chain's

@@ -95,18 +95,23 @@ public:
 	// Picks the adapter that frame generation should run and present on.
 	// Never the game's adapter, never a software adapter. With a name filter, the
 	// single hardware adapter whose description contains it (case-insensitive).
-	// Without one, the adapter that owns the monitor a_window is on; failing that,
+	// Without one, the adapter the monitor a_window is on is plugged into; failing that,
 	// the only remaining hardware adapter. Ambiguity returns null rather than guessing.
+	// "Plugged into" comes from the display configuration (QueryDisplayConfig), not from DXGI's
+	// outputs: on Windows 11 those follow the per-app GPU preference, not the cable.
 	static winrt::com_ptr<IDXGIAdapter1> SelectSecondaryAdapter(IDXGIAdapter* a_gameAdapter,
 		HWND a_window, const std::string& a_nameFilter);
 
 	static std::string AdapterName(IDXGIAdapter* a_adapter);
 
-	// The game is usually placed on the GPU that drives the display, because old games
-	// enumerate adapters and take the first one. For secondary-GPU mode the game must render
-	// on the headless GPU instead. Returns that GPU when a_gameAdapter is the display GPU and
-	// there is exactly one hardware adapter with no display attached; otherwise null.
-	static winrt::com_ptr<IDXGIAdapter1> PickRenderAdapter(IDXGIAdapter* a_gameAdapter);
+	// Where the game should render in secondary-GPU mode: on the GPU that does not present.
+	// With two hardware adapters, returns the other one when the game picked the GPU that drives
+	// the display (by the display configuration, as above) and the other drives none, or, with
+	// a_nameFilter (sSecondaryGPUName), when the game picked the GPU it names. Otherwise null:
+	// the game's own pick stands (also when a Windows GPU preference already put it on the
+	// headless GPU).
+	static winrt::com_ptr<IDXGIAdapter1> PickRenderAdapter(IDXGIAdapter* a_gameAdapter,
+		const std::string& a_nameFilter);
 
 	// a_deviceA: on the game's adapter. a_deviceB: on the secondary adapter.
 	// a_device11/a_context11: the game's D3D11 device and immediate context (adapter A).

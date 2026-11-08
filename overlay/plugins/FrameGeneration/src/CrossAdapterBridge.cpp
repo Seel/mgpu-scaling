@@ -6,6 +6,9 @@
 #include <cctype>
 #include <chrono>
 #include <format>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -68,6 +71,153 @@ namespace
 			if (SUCCEEDED(output->GetDesc(&desc)) && desc.AttachedToDesktop)
 				return true;
 		}
+	}
+
+	std::string LuidText(const LUID& a_luid)
+	{
+		return std::format("{:#010x}-{:#010x}", static_cast<std::uint32_t>(a_luid.HighPart), a_luid.LowPart);
+	}
+
+	// ---- Which GPU a monitor is really plugged into ------------------------------------------
+	//
+	// DXGI's EnumOutputs cannot answer that on Windows 11. For a process with a GPU preference
+	// (Settings > System > Display > Graphics, or the default high-performance GPU chosen there),
+	// DXGI lists the monitors under the preferred adapter, whichever card the cable is in, so that
+	// old games which take "the adapter with the monitor" render on the preferred GPU. Measured on
+	// the user's PC: Fallout 4 set to the RTX 3090 saw "\\.\DISPLAY5" under the 3090 and no output on
+	// the RX 9060 XT the monitor is connected to, and the roles came out inverted. (Windows 10 did
+	// not do this for Fallout 4.)
+	//
+	// The display configuration (CCD: QueryDisplayConfig) is not rearranged per process. Each active
+	// path names the adapter that scans the monitor out, by the same LUID DXGI reports.
+
+	struct DisplayPath
+	{
+		std::wstring gdiName;  // "\\.\DISPLAY5", as in MONITORINFOEX::szDevice
+		LUID target{};         // the adapter that scans the monitor out
+		LUID source{};         // the adapter that owns the desktop source (normally the same)
+	};
+
+	std::vector<DisplayPath> ActiveDisplayPaths()
+	{
+		std::vector<DisplayPath> result;
+		std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+		std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+		UINT32 pathCount = 0;
+		UINT32 modeCount = 0;
+		LONG status = ERROR_INSUFFICIENT_BUFFER;
+		// The configuration can change between the two calls; the documented answer is to ask again.
+		for (int attempt = 0; attempt < 3 && status == ERROR_INSUFFICIENT_BUFFER; ++attempt) {
+			if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+				return result;
+			paths.resize(pathCount);
+			modes.resize(modeCount);
+			status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr);
+		}
+		if (status != ERROR_SUCCESS)
+			return result;
+		paths.resize(pathCount);
+		for (const auto& path : paths) {
+			DISPLAYCONFIG_SOURCE_DEVICE_NAME name{};
+			name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+			name.header.size = sizeof(name);
+			name.header.adapterId = path.sourceInfo.adapterId;
+			name.header.id = path.sourceInfo.id;
+			if (DisplayConfigGetDeviceInfo(&name.header) != ERROR_SUCCESS)
+				continue;
+			result.push_back({ name.viewGdiDeviceName, path.targetInfo.adapterId, path.sourceInfo.adapterId });
+		}
+		return result;
+	}
+
+	// The hardware adapters in DXGI order and what the display configuration says each one drives.
+	struct DisplayMap
+	{
+		std::vector<DisplayPath> paths;
+		std::vector<LUID> hardware;  // non-software adapters DXGI enumerates
+		bool usable = false;         // some active path resolves to one of `hardware`
+
+		// The hardware adapter a path is plugged into: the one scanning it out or, when that is no GPU
+		// DXGI lists (an indirect or virtual display), the one owning its source.
+		std::optional<LUID> Driver(const DisplayPath& a_path) const
+		{
+			for (const auto* luid : { &a_path.target, &a_path.source }) {
+				for (const auto& adapter : hardware) {
+					if (LuidEqual(adapter, *luid))
+						return adapter;
+				}
+			}
+			return std::nullopt;
+		}
+
+		bool DrivesAnyDisplay(const LUID& a_adapter) const
+		{
+			for (const auto& path : paths) {
+				const auto driver = Driver(path);
+				if (driver && LuidEqual(*driver, a_adapter))
+					return true;
+			}
+			return false;
+		}
+
+		bool DrivesMonitor(const LUID& a_adapter, HMONITOR a_monitor) const
+		{
+			const auto name = MonitorName(a_monitor);
+			if (name.empty())
+				return false;
+			for (const auto& path : paths) {
+				if (_wcsicmp(path.gdiName.c_str(), name.c_str()) != 0)
+					continue;
+				const auto driver = Driver(path);
+				if (driver && LuidEqual(*driver, a_adapter))
+					return true;
+			}
+			return false;
+		}
+
+		static std::wstring MonitorName(HMONITOR a_monitor)
+		{
+			MONITORINFOEXW info{};
+			info.cbSize = sizeof(info);
+			if (!a_monitor || !GetMonitorInfoW(a_monitor, &info))
+				return {};
+			return info.szDevice;
+		}
+	};
+
+	DisplayMap MapDisplays(IDXGIFactory1* a_factory)
+	{
+		DisplayMap map;
+		for (UINT index = 0;; ++index) {
+			winrt::com_ptr<IDXGIAdapter1> adapter;
+			if (a_factory->EnumAdapters1(index, adapter.put()) == DXGI_ERROR_NOT_FOUND)
+				break;
+			DXGI_ADAPTER_DESC1 desc{};
+			if (FAILED(adapter->GetDesc1(&desc)))
+				continue;
+			if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414)
+				continue;
+			map.hardware.push_back(desc.AdapterLuid);
+		}
+		map.paths = ActiveDisplayPaths();
+		for (const auto& path : map.paths) {
+			if (map.Driver(path)) {
+				map.usable = true;
+				break;
+			}
+		}
+		return map;
+	}
+
+	// Display-configuration answer when there is one, DXGI's otherwise (logged by the caller).
+	bool DrivesAnyDisplay(const DisplayMap& a_map, IDXGIAdapter1* a_adapter, const LUID& a_luid)
+	{
+		return a_map.usable ? a_map.DrivesAnyDisplay(a_luid) : HasAttachedOutput(a_adapter);
+	}
+
+	bool DrivesMonitor(const DisplayMap& a_map, IDXGIAdapter1* a_adapter, const LUID& a_luid, HMONITOR a_monitor)
+	{
+		return a_map.usable ? a_map.DrivesMonitor(a_luid, a_monitor) : OwnsMonitor(a_adapter, a_monitor);
 	}
 
 	void LogOutputs(IDXGIAdapter1* a_adapter, const std::string& a_name)
@@ -223,7 +373,8 @@ namespace
 	}
 }
 
-winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::PickRenderAdapter(IDXGIAdapter* a_gameAdapter)
+winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::PickRenderAdapter(IDXGIAdapter* a_gameAdapter,
+	const std::string& a_nameFilter)
 {
 	if (!a_gameAdapter)
 		return nullptr;
@@ -231,13 +382,25 @@ winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::PickRenderAdapter(IDXGIAdapter
 	DXGI_ADAPTER_DESC gameDesc{};
 	if (FAILED(a_gameAdapter->GetDesc(&gameDesc)))
 		return nullptr;
+	const std::string gameName = Narrow(gameDesc.Description);
 
 	winrt::com_ptr<IDXGIFactory1> factory;
 	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put()))))
 		return nullptr;
 
-	winrt::com_ptr<IDXGIAdapter1> display;
-	std::vector<winrt::com_ptr<IDXGIAdapter1>> headless;
+	const DisplayMap displays = MapDisplays(factory.get());
+	const std::string filter = Lower(a_nameFilter);
+
+	struct Hardware
+	{
+		winrt::com_ptr<IDXGIAdapter1> adapter;
+		std::string name;
+		bool isGame = false;
+		bool drivesDisplay = false;  // by the display configuration when it answered
+		bool dxgiOutput = false;     // what DXGI's EnumOutputs says (rearranged by the GPU preference)
+		bool named = false;          // sSecondaryGPUName matches
+	};
+	std::vector<Hardware> hardware;
 	for (UINT index = 0;; ++index) {
 		winrt::com_ptr<IDXGIAdapter1> adapter;
 		if (factory->EnumAdapters1(index, adapter.put()) == DXGI_ERROR_NOT_FOUND)
@@ -247,26 +410,56 @@ winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::PickRenderAdapter(IDXGIAdapter
 			continue;
 		if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414)
 			continue;
-		if (HasAttachedOutput(adapter.get()))
-			display = adapter;
-		else
-			headless.push_back(adapter);
+		Hardware entry;
+		entry.name = Narrow(desc.Description);
+		entry.isGame = LuidEqual(desc.AdapterLuid, gameDesc.AdapterLuid);
+		entry.dxgiOutput = HasAttachedOutput(adapter.get());
+		entry.drivesDisplay = DrivesAnyDisplay(displays, adapter.get(), desc.AdapterLuid);
+		entry.named = !filter.empty() && Lower(entry.name).find(filter) != std::string::npos;
+		entry.adapter = adapter;
+		hardware.push_back(std::move(entry));
 	}
 
-	// Only act when the split is unambiguous: one GPU drives the display, one drives nothing.
-	if (!display || headless.size() != 1)
-		return nullptr;
+	if (!displays.usable)
+		REX::WARN("[FG-GPU1] the display configuration (QueryDisplayConfig) named no GPU; telling the GPUs apart by "
+				  "DXGI's outputs, which follow the Windows GPU preference rather than the cable");
+	for (const auto& entry : hardware) {
+		if (displays.usable && entry.dxgiOutput != entry.drivesDisplay)
+			REX::INFO("[FG-GPU1] \"{}\" {}, but DXGI lists {} under it for this process (the Windows GPU "
+					  "preference does that); going by the display configuration",
+				entry.name, entry.drivesDisplay ? "drives a display" : "drives no display",
+				entry.dxgiOutput ? "a monitor" : "no monitor");
+	}
 
-	DXGI_ADAPTER_DESC1 displayDesc{};
-	if (FAILED(display->GetDesc1(&displayDesc)))
-		return nullptr;
+	const auto game = std::find_if(hardware.begin(), hardware.end(), [](const Hardware& a_entry) { return a_entry.isGame; });
+	if (game == hardware.end() || hardware.size() != 2)
+		return nullptr;  // only the unambiguous two-GPU case is moved; SelectSecondaryAdapter logs the rest
+	const Hardware& other = game == hardware.begin() ? hardware.back() : hardware.front();
 
-	// Only move rendering when the game picked the display GPU. The target has no display
-	// attached, so this cannot invert the intended roles if detection is off.
-	if (!LuidEqual(gameDesc.AdapterLuid, displayDesc.AdapterLuid))
+	// sSecondaryGPUName names the GPU that frame generation runs and presents on. If the game picked
+	// that one, it renders on the other. This is the manual override when detection is wrong.
+	if (!filter.empty()) {
+		if (game->named && !other.named) {
+			REX::INFO("[FG-GPU1] the game picked \"{}\", the GPU sSecondaryGPUName=\"{}\" reserves for frame generation; "
+					  "rendering on \"{}\"",
+				gameName, a_nameFilter, other.name);
+			return other.adapter;
+		}
 		return nullptr;
+	}
 
-	return headless.front();
+	// Move rendering only when the game picked the GPU that drives the display and the other one
+	// drives none. With the display configuration this follows the cable. (DXGI alone inverted the
+	// roles on Windows 11 under a GPU preference: it listed the monitor under the game's GPU, so the
+	// GPU really driving it looked headless and the game was moved onto it.)
+	if (game->drivesDisplay && !other.drivesDisplay) {
+		REX::INFO("[FG-GPU1] the game picked \"{}\", which drives the display; \"{}\" drives none", gameName, other.name);
+		return other.adapter;
+	}
+	if (!game->drivesDisplay && other.drivesDisplay)
+		REX::INFO("[FG-GPU1] the game picked \"{}\", which drives no display; it renders there and \"{}\" presents",
+			gameName, other.name);
+	return nullptr;
 }
 
 std::string CrossAdapterBridge::AdapterName(IDXGIAdapter* a_adapter){
@@ -293,6 +486,7 @@ winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::SelectSecondaryAdapter(IDXGIAd
 
 	const HMONITOR monitor = a_window ? MonitorFromWindow(a_window, MONITOR_DEFAULTTONEAREST) : nullptr;
 	const std::string filter = Lower(a_nameFilter);
+	const DisplayMap displays = MapDisplays(factory.get());
 
 	{
 		MONITORINFOEXW info{};
@@ -301,6 +495,14 @@ winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::SelectSecondaryAdapter(IDXGIAd
 		REX::INFO("[FG-GPU1] game window monitor {:#x} \"{}\"", reinterpret_cast<std::uintptr_t>(monitor),
 			resolved ? Narrow(info.szDevice) : "unresolved");
 	}
+	for (const auto& path : displays.paths) {
+		const auto driver = displays.Driver(path);
+		REX::INFO("[FG-GPU1] display configuration: \"{}\" is plugged into luid={}{}", Narrow(path.gdiName.c_str()),
+			LuidText(driver ? *driver : path.target), driver ? "" : " (no GPU DXGI lists)");
+	}
+	if (!displays.usable)
+		REX::WARN("[FG-GPU1] the display configuration (QueryDisplayConfig) named no GPU; going by DXGI's outputs, which "
+				  "follow the Windows GPU preference rather than the cable");
 
 	std::vector<winrt::com_ptr<IDXGIAdapter1>> candidates;
 	std::vector<winrt::com_ptr<IDXGIAdapter1>> named;
@@ -318,15 +520,21 @@ winrt::com_ptr<IDXGIAdapter1> CrossAdapterBridge::SelectSecondaryAdapter(IDXGIAd
 		const std::string name = Narrow(desc.Description);
 		const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId == 0x1414;
 		const bool isGame = LuidEqual(desc.AdapterLuid, gameDesc.AdapterLuid);
-		const bool ownsMonitor = OwnsMonitor(adapter.get(), monitor);
-		const bool hasOutput = HasAttachedOutput(adapter.get());
+		// By the display configuration (the cable) when it answered, else by DXGI's outputs.
+		const bool ownsMonitor = !software && DrivesMonitor(displays, adapter.get(), desc.AdapterLuid, monitor);
+		const bool hasOutput = !software && DrivesAnyDisplay(displays, adapter.get(), desc.AdapterLuid);
+		// DXGI's own view, which the Windows GPU preference rearranges; logged where it differs.
+		const bool dxgiOwnsMonitor = OwnsMonitor(adapter.get(), monitor);
+		const bool dxgiMismatch = displays.usable && !software && dxgiOwnsMonitor != ownsMonitor;
 
-		REX::INFO("[FG-GPU1] adapter[{}] \"{}\" vendor={:#06x} luid={:#010x}-{:#010x} vram={}MB{}{}{}{}",
-			index, name, desc.VendorId,
-			static_cast<std::uint32_t>(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart,
+		REX::INFO("[FG-GPU1] adapter[{}] \"{}\" vendor={:#06x} luid={} vram={}MB{}{}{}{}{}",
+			index, name, desc.VendorId, LuidText(desc.AdapterLuid),
 			desc.DedicatedVideoMemory / (1024 * 1024),
 			isGame ? " [game]" : "", software ? " [software]" : "", ownsMonitor ? " [game window's monitor]" : "",
-			hasOutput ? " [display]" : "");
+			hasOutput ? " [display]" : "",
+			dxgiMismatch ? (dxgiOwnsMonitor ? " [DXGI lists the monitor here: GPU preference, ignored]"
+			                                : " [DXGI hides its monitor: GPU preference, ignored]")
+			             : "");
 		LogOutputs(adapter.get(), name);
 
 		if (software || isGame)
