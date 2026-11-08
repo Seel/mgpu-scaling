@@ -8,6 +8,7 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -785,7 +786,7 @@ void CrossAdapterBridge::GpuTimer::Reset() noexcept
 
 bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
 	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
-	bool a_directCopy)
+	bool a_directCopy, bool a_forceVulkan)
 {
 	Shutdown();
 	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
@@ -897,12 +898,30 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 	QueryPerformanceFrequency(&qpcFrequency);
 	QueryPerformanceCounter(&statLastLog);
 
-	// bDirectGPUCopy: the display GPU's Vulkan side, and the check values A writes behind each lane.
-	// Lanes get their blocks in AddLane; any failure there turns the direct copy off for the session.
+	// bDirectGPUCopy: B's side (D3D12 GPU upload heaps where B offers them, else the Vulkan device), and
+	// the check values A writes behind each lane. Lanes get their blocks in AddLane; any failure there
+	// turns the direct copy off for the session.
+	if (a_directCopy && asyncUnpack) {
+		D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16{};
+		const bool uploadHeaps = SUCCEEDED(deviceB->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &options16,
+									 sizeof(options16))) &&
+		                         options16.GPUUploadHeapSupported;
+		if (uploadHeaps && !a_forceVulkan) {
+			directRoute = DirectRoute::kUploadHeap;
+			REX::INFO("[FG-GPU1] direct GPU copy: D3D12 GPU upload heaps on the display GPU (its VRAM, mapped by its own "
+					  "D3D12 device); its copy queue reads each lane in place. No Vulkan");
+		} else {
+			REX::INFO("[FG-GPU1] direct GPU copy: Vulkan route ({})",
+				uploadHeaps ? "iDirectGPUCopyRoute = 1, although the display GPU offers D3D12 GPU upload heaps" :
+							  "the display GPU's D3D12 offers no GPU upload heaps; they need Windows 11 24H2 and driver support");
+			if (peer.Initialize(deviceB.get(), slotCount))
+				directRoute = DirectRoute::kVulkan;
+		}
+	}
 	if (a_directCopy) {
 		if (!asyncUnpack) {
 			REX::WARN("[FG-GPU1] bDirectGPUCopy needs bAsyncUnpack = 1; frames cross through system memory");
-		} else if (peer.Initialize(deviceB.get(), slotCount)) {
+		} else if (directRoute != DirectRoute::kNone) {
 			D3D12_HEAP_PROPERTIES uploadProps{};
 			uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
 			D3D12_RESOURCE_DESC uploadDesc{};
@@ -933,8 +952,9 @@ bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_dev
 		}
 	}
 
-	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> {} -> {}",
-		directCopy ? "the display GPU's VRAM, directly (bDirectGPUCopy=1)" : "cross-adapter heap in system memory",
+	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> {}{}{} -> {}",
+		directCopy ? "the display GPU's VRAM, directly (bDirectGPUCopy=1, " : "cross-adapter heap in system memory",
+		directCopy ? DirectRouteName() : "", directCopy ? ")" : "",
 		asyncUnpack ? "display GPU copy queue, lane by lane (bAsyncUnpack=1)" :
 					  "display GPU direct queue, after the whole transfer (bAsyncUnpack=0)");
 	return true;
@@ -1064,7 +1084,7 @@ int CrossAdapterBridge::AddLane(const char* a_name, const std::array<ID3D12Resou
 		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
 		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
 		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)",
-		lane.peerLane >= 0 ? " (direct to the display GPU's VRAM)" : "");
+		lane.peerMapped ? " (direct to the display GPU's VRAM)" : "");
 
 	lanes.push_back(std::move(lane));
 	return static_cast<int>(lanes.size() - 1);
@@ -1081,6 +1101,8 @@ bool CrossAdapterBridge::AddDirectLane(Lane& a_lane, UINT64 a_heapSize)
 			a_lane.name, a_what, static_cast<std::uint32_t>(a_hr));
 		a_lane.peerStagingA = nullptr;
 		a_lane.peerHeapA = nullptr;  // before the block it was opened on goes (DisableDirectCopy)
+		a_lane.blockB = nullptr;
+		a_lane.blockHeapB = nullptr;
 		a_lane.landingB = nullptr;
 		a_lane.landingHeapB = nullptr;
 		a_lane.peerMapped = nullptr;
@@ -1089,10 +1111,17 @@ bool CrossAdapterBridge::AddDirectLane(Lane& a_lane, UINT64 a_heapSize)
 	};
 
 	void* mapped = nullptr;
-	const int peerLane = peer.AddLane(a_lane.name.c_str(), a_heapSize, a_lane.slotStride, a_lane.bytes, mapped,
-		a_lane.landingHeapB);
-	if (peerLane < 0 || !mapped || !a_lane.landingHeapB)
-		return failed("the display GPU's VRAM block (Vulkan)", E_FAIL);
+	int peerLane = -1;
+	if (directRoute == DirectRoute::kUploadHeap) {
+		const HRESULT hrBlock = CreateUploadHeapBlock(a_lane, a_heapSize, mapped);
+		if (FAILED(hrBlock) || !mapped)
+			return failed("the display GPU's GPU upload heap (D3D12)", FAILED(hrBlock) ? hrBlock : E_FAIL);
+	} else {
+		peerLane = peer.AddLane(a_lane.name.c_str(), a_heapSize, a_lane.slotStride, a_lane.bytes, mapped,
+			a_lane.landingHeapB);
+		if (peerLane < 0 || !mapped || !a_lane.landingHeapB)
+			return failed("the display GPU's VRAM block (Vulkan)", E_FAIL);
+	}
 	a_lane.peerMapped = static_cast<const volatile std::uint8_t*>(mapped);
 
 	// The render GPU opens the block's CPU address as if it were system memory; its copy engine's writes
@@ -1122,14 +1151,98 @@ bool CrossAdapterBridge::AddDirectLane(Lane& a_lane, UINT64 a_heapSize)
 	if (FAILED(hr))
 		return failed("the render GPU's buffer on the block", hr);
 
-	bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-	hr = deviceB->CreatePlacedResource(a_lane.landingHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-		IID_PPV_ARGS(a_lane.landingB.put()));
-	if (FAILED(hr))
-		return failed("the landing buffer on the display GPU", hr);
+	if (directRoute == DirectRoute::kVulkan) {
+		bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+		hr = deviceB->CreatePlacedResource(a_lane.landingHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON,
+			nullptr, IID_PPV_ARGS(a_lane.landingB.put()));
+		if (FAILED(hr))
+			return failed("the landing buffer on the display GPU", hr);
+	}
 
 	a_lane.peerLane = peerLane;
 	return true;
+}
+
+HRESULT CrossAdapterBridge::CreateUploadHeapBlock(Lane& a_lane, UINT64 a_heapSize, void*& a_mapped)
+{
+	// VRAM that B's D3D12 maps for the CPU through the resizable BAR (D3D12_HEAP_TYPE_GPU_UPLOAD). A's copy
+	// engine writes it through that mapping; B's copy queue reads it like any of its own buffers, at VRAM
+	// speed. tools/p2p-probe --upload-heap checked the whole sequence on the RTX 3090 + RX 9060 XT
+	// (Windows 11): 300 frames with B's read queued before A wrote, no wrong data on B's copy or direct
+	// queue, the check value visible through the mapping the moment A's fence completed, and the heap kept
+	// its address under 19.5 GiB of VRAM pressure on the 16 GB card.
+	D3D12_HEAP_DESC heapDesc{};
+	heapDesc.SizeInBytes = a_heapSize;
+	heapDesc.Properties.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
+	heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+	HRESULT hr = deviceB->CreateHeap(&heapDesc, IID_PPV_ARGS(a_lane.blockHeapB.put()));
+	if (FAILED(hr))
+		return hr;
+
+	// Ask VidMm to keep it in VRAM above everything else (the guard covers it if it ever moves anyway).
+	winrt::com_ptr<ID3D12Device1> deviceB1;
+	if (SUCCEEDED(deviceB->QueryInterface(IID_PPV_ARGS(deviceB1.put())))) {
+		ID3D12Pageable* pageable = a_lane.blockHeapB.get();
+		const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
+		deviceB1->SetResidencyPriority(1, &pageable, &priority);
+	}
+
+	D3D12_RESOURCE_DESC bufferDesc{};
+	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufferDesc.Width = a_heapSize;
+	bufferDesc.Height = 1;
+	bufferDesc.DepthOrArraySize = 1;
+	bufferDesc.MipLevels = 1;
+	bufferDesc.SampleDesc.Count = 1;
+	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	hr = deviceB->CreatePlacedResource(a_lane.blockHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+		IID_PPV_ARGS(a_lane.blockB.put()));
+	if (FAILED(hr))
+		return hr;
+	// Mapped for the bridge's lifetime: A's view and the guard's reads use this address.
+	hr = a_lane.blockB->Map(0, nullptr, &a_mapped);
+	if (FAILED(hr))
+		return hr;
+	REX::INFO("[FG-GPU1] direct GPU copy: lane '{}': {:.1f} MB GPU upload heap on the display GPU (VRAM, CPU-visible, "
+			  "mapped at {}), read in place",
+		a_lane.name, static_cast<double>(a_heapSize) / (1024.0 * 1024.0), a_mapped);
+	return S_OK;
+}
+
+const char* CrossAdapterBridge::DirectRouteName() const noexcept
+{
+	switch (directRoute) {
+	case DirectRoute::kUploadHeap:
+		return "D3D12 GPU upload heaps";
+	case DirectRoute::kVulkan:
+		return "Vulkan";
+	default:
+		return "none";
+	}
+}
+
+void CrossAdapterBridge::ReleaseDirectLanes(bool a_leaveBlocksToWindows) noexcept
+{
+	// A's views first: they lock the blocks' pages, and a block freed under them is what hung the PC at exit
+	// with the first build. Then B's side: its own GPU upload heaps (D3D12 route) or landing heaps (Vulkan).
+	for (auto& lane : lanes) {
+		lane.peerStagingA = nullptr;
+		lane.peerHeapA = nullptr;
+	}
+	for (auto& lane : lanes) {
+		if (a_leaveBlocksToWindows) {
+			// B may still be reading them: never released, freed by Windows' process teardown.
+			std::ignore = lane.blockB.detach();
+			std::ignore = lane.blockHeapB.detach();
+		}
+		lane.blockB = nullptr;
+		lane.blockHeapB = nullptr;
+		lane.landingB = nullptr;
+		lane.landingHeapB = nullptr;
+		lane.peerMapped = nullptr;
+		lane.peerLane = -1;
+		lane.checkPending = {};
+	}
 }
 
 void CrossAdapterBridge::DisableDirectCopy()
@@ -1139,15 +1252,9 @@ void CrossAdapterBridge::DisableDirectCopy()
 	// have used them, they stay until Shutdown: copies may still be in flight.
 	if (transferValue != 0)
 		return;
-	for (auto& lane : lanes) {
-		lane.peerStagingA = nullptr;
-		lane.peerHeapA = nullptr;
-		lane.landingB = nullptr;
-		lane.landingHeapB = nullptr;
-		lane.peerMapped = nullptr;
-		lane.peerLane = -1;
-	}
+	ReleaseDirectLanes();
 	peer.Shutdown();
+	directRoute = DirectRoute::kNone;
 	checkCpu = nullptr;
 	checkUploadA = nullptr;
 }
@@ -1165,13 +1272,13 @@ void CrossAdapterBridge::ReleaseDirectCopyForExit(const char* a_why) noexcept
 
 	bool open = false;
 	for (const auto& lane : lanes)
-		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr;
+		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr || lane.blockHeapB != nullptr;
 	if (!open && !peer.Ready())
 		return;
 	directCopy = false;
 
 	// Everything the GPUs were given: the render GPU's lane copies (each signals the transfer fence), and
-	// the display GPU's reads (each waited for its Vulkan copy before it ran, then signalled readFenceB).
+	// the display GPU's reads (each signalled readFenceB; on the Vulkan route after waiting for its copy).
 	bool idle = true;
 	if (transferFenceA && nextLaneValue)
 		idle &= SUCCEEDED(WaitCpu(transferFenceA.get(), nextLaneValue));
@@ -1179,17 +1286,9 @@ void CrossAdapterBridge::ReleaseDirectCopyForExit(const char* a_why) noexcept
 		idle &= SUCCEEDED(WaitCpu(readFenceB.get(), readValue));
 
 	// The render GPU's views first (this ends its lock on the blocks' pages), then the display GPU's side.
-	for (auto& lane : lanes) {
-		lane.peerStagingA = nullptr;
-		lane.peerHeapA = nullptr;
-	}
-	for (auto& lane : lanes) {
-		lane.landingB = nullptr;
-		lane.landingHeapB = nullptr;
-		lane.peerMapped = nullptr;
-		lane.peerLane = -1;
-		lane.checkPending = {};
-	}
+	// If the display GPU may still be reading its GPU upload heaps (D3D12 route), they are left to Windows'
+	// teardown instead of freed under it; the render GPU has let go of them either way.
+	ReleaseDirectLanes(!idle);
 	// The Vulkan side (it waits for its own queue). If the GPUs were not idle its copies may still read
 	// the blocks: those are then left to Windows' teardown, which is safe now that the render GPU has let go.
 	if (idle)
@@ -1207,8 +1306,8 @@ void CrossAdapterBridge::TripDirectCopy(const std::string& a_why)
 	directCopyTripped = true;
 	directCopy = false;
 	REX::CRITICAL("[FG-GPU1] direct GPU copy guard: {}. Frames cross through system memory from the next frame on and "
-				  "frame generation is OFF for the rest of the session. Restart the game; set bDirectGPUCopy = 0 if this "
-				  "happens again.",
+				  "frame generation is OFF for the rest of the session. Restart the game; set bDirectGPUCopy = 0 (or try "
+				  "iDirectGPUCopyRoute = 1, the Vulkan route) if this happens again.",
 		a_why);
 }
 
@@ -1793,13 +1892,15 @@ HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order
 		if (position == 0)
 			timerCopyB.Mark(listB.get(), a_slot, a_markBase);
 
-		// bDirectGPUCopy: the lane arrives in its landing heap (local VRAM) instead of the cross-adapter heap.
-		const bool direct = frameDirect && lane.landingB;
+		// bDirectGPUCopy: the lane is read from local VRAM instead of the cross-adapter heap: its GPU upload
+		// heap (D3D12 route) or its landing heap (Vulkan route).
+		ID3D12Resource* directSource = frameDirect ? DirectSourceB(lane) : nullptr;
+		const bool direct = directSource != nullptr;
 
 		// Mirrors are COMMON between uses; the back buffer is PRESENT, which is the same state.
 		if (dest)
 			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON,
-				direct ? lane.landingB.get() : lane.stagingB.get());
+				direct ? directSource : lane.stagingB.get());
 
 		if (position + 1 == a_count) {
 			timerCopyB.Mark(listB.get(), a_slot, a_markBase + 1);
@@ -1820,7 +1921,9 @@ HRESULT CrossAdapterBridge::SubmitUnpackLanes(UINT a_slot, const size_t* a_order
 			Fail("unpack queue Wait (transfer)", hr);
 			return hr;
 		}
-		if (direct) {
+		// Vulkan route only: the block is copied into the landing heap first. A GPU upload heap is read in
+		// place right after the wait above.
+		if (direct && directRoute == DirectRoute::kVulkan) {
 			hr = QueueDirectCopy(lane, a_slot);
 			if (FAILED(hr))
 				return hr;
@@ -2418,6 +2521,10 @@ void CrossAdapterBridge::LogStats()
 	if (directCopyTripped) {
 		REX::INFO("[FG-GPU1] direct GPU copy: OFF since its guard tripped (see the CRITICAL line); frames cross through "
 				  "system memory, frame generation is off");
+	} else if ((directCopy || statDirectFrames) && directRoute == DirectRoute::kUploadHeap) {
+		REX::INFO("[FG-GPU1] direct GPU copy: {}/{} frames into the display GPU's VRAM (D3D12 GPU upload heaps, read in "
+				  "place) | check values found {} (late {})",
+			statDirectFrames, statFrames, statDirectChecks, statDirectLate);
 	} else if (directCopy || statDirectFrames) {
 		REX::INFO("[FG-GPU1] direct GPU copy: {}/{} frames into the display GPU's VRAM | its Vulkan copy into the landing "
 				  "heaps ({}) avg {:.2f} ms max {:.2f} ms per frame | check values found {} (late {})",
@@ -2468,11 +2575,13 @@ void CrossAdapterBridge::Shutdown() noexcept
 	active = false;
 	asyncUnpack = true;
 	ResetUpsampler();
-	// The render GPU's heaps on the display GPU's VRAM blocks go first (with the lanes), then the
-	// Vulkan side that owns the blocks.
+	// The render GPU's heaps on the display GPU's VRAM blocks go first, then the blocks: the lanes' own
+	// GPU upload heaps (D3D12 route), or the Vulkan side that owns them.
+	ReleaseDirectLanes();
 	lanes.clear();
 	peer.Shutdown();
 	directCopy = false;
+	directRoute = DirectRoute::kNone;
 	directCopyTripped = false;
 	frameDirect = false;
 	peerValue = 0;

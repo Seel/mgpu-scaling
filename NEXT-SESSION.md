@@ -1,5 +1,40 @@
 # Next session: start here
 
+## D3D12 direct-copy route: works in game (2026-11-09 00:47-00:49)
+
+User's run with `iDirectGPUCopyRoute = 0`, 3090 preferred (log also shows the GPU-role fix's
+3090-start path: `the game picked "NVIDIA GeForce RTX 3090", which drives no display; it renders
+there`), FSR 4.1 Quality, 3 frames in flight, AutoHDR:
+- `D3D12 GPU upload heaps on the display GPU ... No Vulkan`; four lanes as GPU upload heaps (95.1 MB
+  final frame, 3 x 42.4 MB render-res lanes); no Vulkan device created.
+- Every frame direct in every 10 s window (e.g. 694/694), check values late 0, no errors or guard.
+- 61.3-70.8 game fps → 122.5-138.8 presented, 50% generated (one window 9% with a history reset:
+  a camera cut, not the copy). Copy on 3090 7.56-7.84 ms; display GPU unpack (copy queue, now reading
+  the upload heaps) avg 2.3 ms, ending 0.6-0.7 ms after the 3090's copy ends; submit 0.30-0.32 ms
+  (Vulkan run 00:24: 0.40 ms).
+- Clean exit: `the game is terminating itself; closed the render GPU's views ..., then freed the blocks`.
+Not done: a same-spot A/B against `iDirectGPUCopyRoute = 1` (the 00:24 Vulkan run was elsewhere).
+
+### The test plan as written before the run
+
+`bDirectGPUCopy` has a second route now: on Windows 11 24H2+ the 9060's own D3D12 device owns the
+VRAM blocks as **GPU upload heaps** and its copy queue unpacks straight out of them: no Vulkan device,
+no landing heap, no per-frame Vulkan copy (1.5-1.6 ms avg on Win11 in the 00:24 run), half the extra
+VRAM. `iDirectGPUCopyRoute` (`[FrameGeneration]`, MCM "Direct Copy Route"): 0 = automatic (D3D12 when
+the 9060 offers GPU upload heaps, else Vulkan), 1 = Vulkan (kept for Windows 10 and for A/B). Proven
+first in `tools/p2p-probe --upload-heap` (probe README, "Measured on Windows 11"). Build:
+`D:\fgb\MGPU-Scaling.zip` (2026-11-09 ~00:5x). Not run in game yet.
+
+Test (user's settings: bDirectGPUCopy=1, 3 frames in flight, FSR 4.1 Quality, AutoHDR):
+1. `iDirectGPUCopyRoute = 0`: expect `direct GPU copy: D3D12 GPU upload heaps on the display GPU ...
+   No Vulkan`, per lane `... GPU upload heap on the display GPU (VRAM, CPU-visible, mapped at ...), read
+   in place`, every 10 s `N/N frames into the display GPU's VRAM (D3D12 GPU upload heaps, read in place)
+   | check values found ... (late 0)`, and no `direct GPU copy: Vulkan ...` line. At quit: `closed the
+   render GPU's views ..., then freed the blocks`. Compare game fps, `display GPU: unpack`, `timeline`
+   and `submit` with the 00:24 Vulkan run (63.7-66.3 game fps, copy on 3090 7.75 ms, submit 0.40 ms).
+2. `iDirectGPUCopyRoute = 1`: the Vulkan route as before, for the A/B at the same spot.
+Keep both logs (`tools/save-runs.ps1`).
+
 ## Windows 11 GPU-role fix: works in game (2026-11-09)
 
 On Windows 11 the game crashed at start because the Windows GPU preference (3090 preferred) makes

@@ -360,10 +360,10 @@ index 0000000..7e1cb91
 +}
 diff --git a/package/MCM/Config/MGPUScaling/config.json b/package/MCM/Config/MGPUScaling/config.json
 new file mode 100644
-index 0000000..eb6347a
+index 0000000..12b38c3
 --- /dev/null
 +++ b/package/MCM/Config/MGPUScaling/config.json
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,428 @@
 +{
 +	"modName": "MGPUScaling",
 +	"displayName": "MGPU Scaling",
@@ -675,6 +675,19 @@ index 0000000..eb6347a
 +					}
 +				},
 +				{
++					"id": "iDirectGPUCopyRoute:FrameGeneration",
++					"text": "Direct Copy Route (restart)",
++					"type": "stepper",
++					"help": "How the second GPU holds the VRAM the render GPU writes into. Automatic: D3D12 GPU upload heaps where the second GPU offers them (Windows 11 24H2 or newer with driver support): its own D3D12 reads each frame in place, no Vulkan, no extra copy, half the extra VRAM. Otherwise Vulkan. Vulkan: always the Vulkan route (Windows 10's only one; a small Vulkan device copies each frame into D3D12), for comparing. Requires a game restart. (Default: Automatic)",
++					"valueOptions": {
++						"sourceType": "ModSettingInt",
++						"options": [
++							"Automatic",
++							"Vulkan"
++						]
++					}
++				},
++				{
 +					"text": "",
 +					"type": "text"
 +				},
@@ -781,10 +794,10 @@ index 0000000..eb6347a
 +}
 diff --git a/package/MCM/Config/MGPUScaling/settings.ini b/package/MCM/Config/MGPUScaling/settings.ini
 new file mode 100644
-index 0000000..ec267f1
+index 0000000..53872a7
 --- /dev/null
 +++ b/package/MCM/Config/MGPUScaling/settings.ini
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,162 @@
 +; MGPU Scaling: shipped defaults. MCM (MGPU Scaling) writes your changes to
 +; Data\MCM\Settings\MGPUScaling.ini, which overrides this file; set keys there by hand too.
 +; On the first start without that file, the plugin copies your settings from the old
@@ -906,7 +919,8 @@ index 0000000..ec267f1
 +; [FG-GPU1] EXPERIMENTAL. Direct GPU-to-GPU copy: the render GPU writes each frame straight into the
 +; frame-generation GPU's VRAM over PCIe, instead of into system memory for the other GPU to read back
 +; out. One PCIe trip instead of two, and no system RAM traffic. Needs Resizable BAR (Smart Access
-+; Memory) on the frame-generation GPU, a Vulkan driver for it, and bAsyncUnpack = 1; if anything is
++; Memory) on the frame-generation GPU, D3D12 GPU upload heaps or a Vulkan driver on it (see
++; iDirectGPUCopyRoute), and bAsyncUnpack = 1; if anything is
 +; missing the log says why and frames go through system memory as before. Uses no documented
 +; peer-to-peer API (the render GPU opens the other GPU's CPU-visible VRAM as if it were RAM), so a
 +; driver update could break it. A guard checks every frame that the data landed where it should; if
@@ -914,6 +928,15 @@ index 0000000..ec267f1
 +; rest of the session, so you notice (the log line "direct GPU copy guard" says why).
 +; Requires restart. Default: false
 +bDirectGPUCopy = 0
++
++; [FG-GPU1] How the frame-generation GPU holds the VRAM the render GPU writes into (bDirectGPUCopy).
++; 0 = automatic: D3D12 GPU upload heaps where that GPU's D3D12 offers them (Windows 11 24H2 or newer
++;     with driver support). It reads each frame in place: no Vulkan device, no per-frame copy, half
++;     the extra VRAM. Otherwise the Vulkan route.
++; 1 = always the Vulkan route (the only one on Windows 10): a small Vulkan device owns the VRAM and
++;     copies each frame into D3D12. For comparing.
++; Requires restart. Default: 0
++iDirectGPUCopyRoute = 0
 +
 +[Upscaling]
 +; Upscaling reconstructs lower resolutions to the native resolution using advanced algorithms, improving image quality and performance.
@@ -939,10 +962,10 @@ index 0000000..ec267f1
 +bEnableDebugLogging = 0
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.cpp b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
 new file mode 100644
-index 0000000..0b372a0
+index 0000000..be46da8
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.cpp
-@@ -0,0 +1,2527 @@
+@@ -0,0 +1,2636 @@
 +#include "CrossAdapterBridge.h"
 +
 +#include <d3dcompiler.h>
@@ -953,6 +976,7 @@ index 0000000..0b372a0
 +#include <format>
 +#include <optional>
 +#include <string>
++#include <tuple>
 +#include <vector>
 +
 +namespace
@@ -1730,7 +1754,7 @@ index 0000000..0b372a0
 +
 +bool CrossAdapterBridge::Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
 +	ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
-+	bool a_directCopy)
++	bool a_directCopy, bool a_forceVulkan)
 +{
 +	Shutdown();
 +	if (!a_deviceA || !a_deviceB || !a_device11 || !a_context11)
@@ -1842,12 +1866,30 @@ index 0000000..0b372a0
 +	QueryPerformanceFrequency(&qpcFrequency);
 +	QueryPerformanceCounter(&statLastLog);
 +
-+	// bDirectGPUCopy: the display GPU's Vulkan side, and the check values A writes behind each lane.
-+	// Lanes get their blocks in AddLane; any failure there turns the direct copy off for the session.
++	// bDirectGPUCopy: B's side (D3D12 GPU upload heaps where B offers them, else the Vulkan device), and
++	// the check values A writes behind each lane. Lanes get their blocks in AddLane; any failure there
++	// turns the direct copy off for the session.
++	if (a_directCopy && asyncUnpack) {
++		D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16{};
++		const bool uploadHeaps = SUCCEEDED(deviceB->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &options16,
++									 sizeof(options16))) &&
++		                         options16.GPUUploadHeapSupported;
++		if (uploadHeaps && !a_forceVulkan) {
++			directRoute = DirectRoute::kUploadHeap;
++			REX::INFO("[FG-GPU1] direct GPU copy: D3D12 GPU upload heaps on the display GPU (its VRAM, mapped by its own "
++					  "D3D12 device); its copy queue reads each lane in place. No Vulkan");
++		} else {
++			REX::INFO("[FG-GPU1] direct GPU copy: Vulkan route ({})",
++				uploadHeaps ? "iDirectGPUCopyRoute = 1, although the display GPU offers D3D12 GPU upload heaps" :
++							  "the display GPU's D3D12 offers no GPU upload heaps; they need Windows 11 24H2 and driver support");
++			if (peer.Initialize(deviceB.get(), slotCount))
++				directRoute = DirectRoute::kVulkan;
++		}
++	}
 +	if (a_directCopy) {
 +		if (!asyncUnpack) {
 +			REX::WARN("[FG-GPU1] bDirectGPUCopy needs bAsyncUnpack = 1; frames cross through system memory");
-+		} else if (peer.Initialize(deviceB.get(), slotCount)) {
++		} else if (directRoute != DirectRoute::kNone) {
 +			D3D12_HEAP_PROPERTIES uploadProps{};
 +			uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
 +			D3D12_RESOURCE_DESC uploadDesc{};
@@ -1878,8 +1920,9 @@ index 0000000..0b372a0
 +		}
 +	}
 +
-+	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> {} -> {}",
-+		directCopy ? "the display GPU's VRAM, directly (bDirectGPUCopy=1)" : "cross-adapter heap in system memory",
++	REX::INFO("[FG-GPU1] bridge ready: render GPU copy queue -> {}{}{} -> {}",
++		directCopy ? "the display GPU's VRAM, directly (bDirectGPUCopy=1, " : "cross-adapter heap in system memory",
++		directCopy ? DirectRouteName() : "", directCopy ? ")" : "",
 +		asyncUnpack ? "display GPU copy queue, lane by lane (bAsyncUnpack=1)" :
 +					  "display GPU direct queue, after the whole transfer (bAsyncUnpack=0)");
 +	return true;
@@ -2009,7 +2052,7 @@ index 0000000..0b372a0
 +		lanes.size(), lane.name, lane.desc.Width, lane.desc.Height, static_cast<int>(lane.desc.Format),
 +		lane.footprint.Footprint.RowPitch, lane.bytes, static_cast<double>(bytesPerFrame) / (1024.0 * 1024.0),
 +		TimingName(a_timing), a_createMirror ? "" : " (unpacked into the back buffer)",
-+		lane.peerLane >= 0 ? " (direct to the display GPU's VRAM)" : "");
++		lane.peerMapped ? " (direct to the display GPU's VRAM)" : "");
 +
 +	lanes.push_back(std::move(lane));
 +	return static_cast<int>(lanes.size() - 1);
@@ -2026,6 +2069,8 @@ index 0000000..0b372a0
 +			a_lane.name, a_what, static_cast<std::uint32_t>(a_hr));
 +		a_lane.peerStagingA = nullptr;
 +		a_lane.peerHeapA = nullptr;  // before the block it was opened on goes (DisableDirectCopy)
++		a_lane.blockB = nullptr;
++		a_lane.blockHeapB = nullptr;
 +		a_lane.landingB = nullptr;
 +		a_lane.landingHeapB = nullptr;
 +		a_lane.peerMapped = nullptr;
@@ -2034,10 +2079,17 @@ index 0000000..0b372a0
 +	};
 +
 +	void* mapped = nullptr;
-+	const int peerLane = peer.AddLane(a_lane.name.c_str(), a_heapSize, a_lane.slotStride, a_lane.bytes, mapped,
-+		a_lane.landingHeapB);
-+	if (peerLane < 0 || !mapped || !a_lane.landingHeapB)
-+		return failed("the display GPU's VRAM block (Vulkan)", E_FAIL);
++	int peerLane = -1;
++	if (directRoute == DirectRoute::kUploadHeap) {
++		const HRESULT hrBlock = CreateUploadHeapBlock(a_lane, a_heapSize, mapped);
++		if (FAILED(hrBlock) || !mapped)
++			return failed("the display GPU's GPU upload heap (D3D12)", FAILED(hrBlock) ? hrBlock : E_FAIL);
++	} else {
++		peerLane = peer.AddLane(a_lane.name.c_str(), a_heapSize, a_lane.slotStride, a_lane.bytes, mapped,
++			a_lane.landingHeapB);
++		if (peerLane < 0 || !mapped || !a_lane.landingHeapB)
++			return failed("the display GPU's VRAM block (Vulkan)", E_FAIL);
++	}
 +	a_lane.peerMapped = static_cast<const volatile std::uint8_t*>(mapped);
 +
 +	// The render GPU opens the block's CPU address as if it were system memory; its copy engine's writes
@@ -2067,14 +2119,98 @@ index 0000000..0b372a0
 +	if (FAILED(hr))
 +		return failed("the render GPU's buffer on the block", hr);
 +
-+	bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-+	hr = deviceB->CreatePlacedResource(a_lane.landingHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-+		IID_PPV_ARGS(a_lane.landingB.put()));
-+	if (FAILED(hr))
-+		return failed("the landing buffer on the display GPU", hr);
++	if (directRoute == DirectRoute::kVulkan) {
++		bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
++		hr = deviceB->CreatePlacedResource(a_lane.landingHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON,
++			nullptr, IID_PPV_ARGS(a_lane.landingB.put()));
++		if (FAILED(hr))
++			return failed("the landing buffer on the display GPU", hr);
++	}
 +
 +	a_lane.peerLane = peerLane;
 +	return true;
++}
++
++HRESULT CrossAdapterBridge::CreateUploadHeapBlock(Lane& a_lane, UINT64 a_heapSize, void*& a_mapped)
++{
++	// VRAM that B's D3D12 maps for the CPU through the resizable BAR (D3D12_HEAP_TYPE_GPU_UPLOAD). A's copy
++	// engine writes it through that mapping; B's copy queue reads it like any of its own buffers, at VRAM
++	// speed. tools/p2p-probe --upload-heap checked the whole sequence on the RTX 3090 + RX 9060 XT
++	// (Windows 11): 300 frames with B's read queued before A wrote, no wrong data on B's copy or direct
++	// queue, the check value visible through the mapping the moment A's fence completed, and the heap kept
++	// its address under 19.5 GiB of VRAM pressure on the 16 GB card.
++	D3D12_HEAP_DESC heapDesc{};
++	heapDesc.SizeInBytes = a_heapSize;
++	heapDesc.Properties.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
++	heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
++	HRESULT hr = deviceB->CreateHeap(&heapDesc, IID_PPV_ARGS(a_lane.blockHeapB.put()));
++	if (FAILED(hr))
++		return hr;
++
++	// Ask VidMm to keep it in VRAM above everything else (the guard covers it if it ever moves anyway).
++	winrt::com_ptr<ID3D12Device1> deviceB1;
++	if (SUCCEEDED(deviceB->QueryInterface(IID_PPV_ARGS(deviceB1.put())))) {
++		ID3D12Pageable* pageable = a_lane.blockHeapB.get();
++		const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
++		deviceB1->SetResidencyPriority(1, &pageable, &priority);
++	}
++
++	D3D12_RESOURCE_DESC bufferDesc{};
++	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++	bufferDesc.Width = a_heapSize;
++	bufferDesc.Height = 1;
++	bufferDesc.DepthOrArraySize = 1;
++	bufferDesc.MipLevels = 1;
++	bufferDesc.SampleDesc.Count = 1;
++	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++	hr = deviceB->CreatePlacedResource(a_lane.blockHeapB.get(), 0, &bufferDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(a_lane.blockB.put()));
++	if (FAILED(hr))
++		return hr;
++	// Mapped for the bridge's lifetime: A's view and the guard's reads use this address.
++	hr = a_lane.blockB->Map(0, nullptr, &a_mapped);
++	if (FAILED(hr))
++		return hr;
++	REX::INFO("[FG-GPU1] direct GPU copy: lane '{}': {:.1f} MB GPU upload heap on the display GPU (VRAM, CPU-visible, "
++			  "mapped at {}), read in place",
++		a_lane.name, static_cast<double>(a_heapSize) / (1024.0 * 1024.0), a_mapped);
++	return S_OK;
++}
++
++const char* CrossAdapterBridge::DirectRouteName() const noexcept
++{
++	switch (directRoute) {
++	case DirectRoute::kUploadHeap:
++		return "D3D12 GPU upload heaps";
++	case DirectRoute::kVulkan:
++		return "Vulkan";
++	default:
++		return "none";
++	}
++}
++
++void CrossAdapterBridge::ReleaseDirectLanes(bool a_leaveBlocksToWindows) noexcept
++{
++	// A's views first: they lock the blocks' pages, and a block freed under them is what hung the PC at exit
++	// with the first build. Then B's side: its own GPU upload heaps (D3D12 route) or landing heaps (Vulkan).
++	for (auto& lane : lanes) {
++		lane.peerStagingA = nullptr;
++		lane.peerHeapA = nullptr;
++	}
++	for (auto& lane : lanes) {
++		if (a_leaveBlocksToWindows) {
++			// B may still be reading them: never released, freed by Windows' process teardown.
++			std::ignore = lane.blockB.detach();
++			std::ignore = lane.blockHeapB.detach();
++		}
++		lane.blockB = nullptr;
++		lane.blockHeapB = nullptr;
++		lane.landingB = nullptr;
++		lane.landingHeapB = nullptr;
++		lane.peerMapped = nullptr;
++		lane.peerLane = -1;
++		lane.checkPending = {};
++	}
 +}
 +
 +void CrossAdapterBridge::DisableDirectCopy()
@@ -2084,15 +2220,9 @@ index 0000000..0b372a0
 +	// have used them, they stay until Shutdown: copies may still be in flight.
 +	if (transferValue != 0)
 +		return;
-+	for (auto& lane : lanes) {
-+		lane.peerStagingA = nullptr;
-+		lane.peerHeapA = nullptr;
-+		lane.landingB = nullptr;
-+		lane.landingHeapB = nullptr;
-+		lane.peerMapped = nullptr;
-+		lane.peerLane = -1;
-+	}
++	ReleaseDirectLanes();
 +	peer.Shutdown();
++	directRoute = DirectRoute::kNone;
 +	checkCpu = nullptr;
 +	checkUploadA = nullptr;
 +}
@@ -2110,13 +2240,13 @@ index 0000000..0b372a0
 +
 +	bool open = false;
 +	for (const auto& lane : lanes)
-+		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr;
++		open |= lane.peerHeapA != nullptr || lane.landingHeapB != nullptr || lane.blockHeapB != nullptr;
 +	if (!open && !peer.Ready())
 +		return;
 +	directCopy = false;
 +
 +	// Everything the GPUs were given: the render GPU's lane copies (each signals the transfer fence), and
-+	// the display GPU's reads (each waited for its Vulkan copy before it ran, then signalled readFenceB).
++	// the display GPU's reads (each signalled readFenceB; on the Vulkan route after waiting for its copy).
 +	bool idle = true;
 +	if (transferFenceA && nextLaneValue)
 +		idle &= SUCCEEDED(WaitCpu(transferFenceA.get(), nextLaneValue));
@@ -2124,17 +2254,9 @@ index 0000000..0b372a0
 +		idle &= SUCCEEDED(WaitCpu(readFenceB.get(), readValue));
 +
 +	// The render GPU's views first (this ends its lock on the blocks' pages), then the display GPU's side.
-+	for (auto& lane : lanes) {
-+		lane.peerStagingA = nullptr;
-+		lane.peerHeapA = nullptr;
-+	}
-+	for (auto& lane : lanes) {
-+		lane.landingB = nullptr;
-+		lane.landingHeapB = nullptr;
-+		lane.peerMapped = nullptr;
-+		lane.peerLane = -1;
-+		lane.checkPending = {};
-+	}
++	// If the display GPU may still be reading its GPU upload heaps (D3D12 route), they are left to Windows'
++	// teardown instead of freed under it; the render GPU has let go of them either way.
++	ReleaseDirectLanes(!idle);
 +	// The Vulkan side (it waits for its own queue). If the GPUs were not idle its copies may still read
 +	// the blocks: those are then left to Windows' teardown, which is safe now that the render GPU has let go.
 +	if (idle)
@@ -2152,8 +2274,8 @@ index 0000000..0b372a0
 +	directCopyTripped = true;
 +	directCopy = false;
 +	REX::CRITICAL("[FG-GPU1] direct GPU copy guard: {}. Frames cross through system memory from the next frame on and "
-+				  "frame generation is OFF for the rest of the session. Restart the game; set bDirectGPUCopy = 0 if this "
-+				  "happens again.",
++				  "frame generation is OFF for the rest of the session. Restart the game; set bDirectGPUCopy = 0 (or try "
++				  "iDirectGPUCopyRoute = 1, the Vulkan route) if this happens again.",
 +		a_why);
 +}
 +
@@ -2738,13 +2860,15 @@ index 0000000..0b372a0
 +		if (position == 0)
 +			timerCopyB.Mark(listB.get(), a_slot, a_markBase);
 +
-+		// bDirectGPUCopy: the lane arrives in its landing heap (local VRAM) instead of the cross-adapter heap.
-+		const bool direct = frameDirect && lane.landingB;
++		// bDirectGPUCopy: the lane is read from local VRAM instead of the cross-adapter heap: its GPU upload
++		// heap (D3D12 route) or its landing heap (Vulkan route).
++		ID3D12Resource* directSource = frameDirect ? DirectSourceB(lane) : nullptr;
++		const bool direct = directSource != nullptr;
 +
 +		// Mirrors are COMMON between uses; the back buffer is PRESENT, which is the same state.
 +		if (dest)
 +			RecordLaneCopy(listB.get(), lane, a_slot, dest, D3D12_RESOURCE_STATE_COMMON,
-+				direct ? lane.landingB.get() : lane.stagingB.get());
++				direct ? directSource : lane.stagingB.get());
 +
 +		if (position + 1 == a_count) {
 +			timerCopyB.Mark(listB.get(), a_slot, a_markBase + 1);
@@ -2765,7 +2889,9 @@ index 0000000..0b372a0
 +			Fail("unpack queue Wait (transfer)", hr);
 +			return hr;
 +		}
-+		if (direct) {
++		// Vulkan route only: the block is copied into the landing heap first. A GPU upload heap is read in
++		// place right after the wait above.
++		if (direct && directRoute == DirectRoute::kVulkan) {
 +			hr = QueueDirectCopy(lane, a_slot);
 +			if (FAILED(hr))
 +				return hr;
@@ -3363,6 +3489,10 @@ index 0000000..0b372a0
 +	if (directCopyTripped) {
 +		REX::INFO("[FG-GPU1] direct GPU copy: OFF since its guard tripped (see the CRITICAL line); frames cross through "
 +				  "system memory, frame generation is off");
++	} else if ((directCopy || statDirectFrames) && directRoute == DirectRoute::kUploadHeap) {
++		REX::INFO("[FG-GPU1] direct GPU copy: {}/{} frames into the display GPU's VRAM (D3D12 GPU upload heaps, read in "
++				  "place) | check values found {} (late {})",
++			statDirectFrames, statFrames, statDirectChecks, statDirectLate);
 +	} else if (directCopy || statDirectFrames) {
 +		REX::INFO("[FG-GPU1] direct GPU copy: {}/{} frames into the display GPU's VRAM | its Vulkan copy into the landing "
 +				  "heaps ({}) avg {:.2f} ms max {:.2f} ms per frame | check values found {} (late {})",
@@ -3413,11 +3543,13 @@ index 0000000..0b372a0
 +	active = false;
 +	asyncUnpack = true;
 +	ResetUpsampler();
-+	// The render GPU's heaps on the display GPU's VRAM blocks go first (with the lanes), then the
-+	// Vulkan side that owns the blocks.
++	// The render GPU's heaps on the display GPU's VRAM blocks go first, then the blocks: the lanes' own
++	// GPU upload heaps (D3D12 route), or the Vulkan side that owns them.
++	ReleaseDirectLanes();
 +	lanes.clear();
 +	peer.Shutdown();
 +	directCopy = false;
++	directRoute = DirectRoute::kNone;
 +	directCopyTripped = false;
 +	frameDirect = false;
 +	peerValue = 0;
@@ -3472,10 +3604,10 @@ index 0000000..0b372a0
 +}
 diff --git a/plugins/FrameGeneration/src/CrossAdapterBridge.h b/plugins/FrameGeneration/src/CrossAdapterBridge.h
 new file mode 100644
-index 0000000..476c628
+index 0000000..0f87ef1
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/CrossAdapterBridge.h
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,535 @@
 +#pragma once
 +
 +// CrossAdapterBridge - frame generation on a second GPU.
@@ -3511,12 +3643,17 @@ index 0000000..476c628
 +//   writes the slot again, so the render GPU never waits on PCIe for the
 +//   frame it is working on.
 +//
-+// Direct GPU copy (bDirectGPUCopy, async unpack only; PeerCopy.h): instead of the cross-adapter
-+// heap in system memory, A's copy queue writes each lane straight into a block of B's VRAM (B's
-+// Vulkan device maps it through the resizable BAR, A opens the mapping with
-+// OpenExistingHeapFromAddress), plus a check value behind the data. On B's copy queue, per lane:
-+// Wait(transfer), Signal(landed) -> Vulkan copies the block into a D3D12 landing heap and signals
-+// copied -> Wait(copied), then the usual unpack, from the landing heap. One PCIe trip, no system RAM.
++// Direct GPU copy (bDirectGPUCopy, async unpack only): instead of the cross-adapter heap in system
++// memory, A's copy queue writes each lane straight into a block of B's VRAM that is mapped for the CPU
++// through the resizable BAR (A opens the mapping with OpenExistingHeapFromAddress), plus a check value
++// behind the data. One PCIe trip, no system RAM. B's side has two routes:
++//   - D3D12 GPU upload heaps (Windows 11 24H2+, when B's driver offers them; iDirectGPUCopyRoute = 0):
++//     B's D3D12 device creates and maps the block itself, and B's copy queue unpacks straight from it
++//     after Wait(transfer), like the system-memory path. No Vulkan, no landing heap, no extra copy.
++//   - Vulkan (PeerCopy.h; Windows 10, or iDirectGPUCopyRoute = 1): B's D3D12 cannot map VRAM there, so
++//     a Vulkan device on B owns the block. Per lane on B's copy queue: Wait(transfer), Signal(landed) ->
++//     Vulkan copies the block into a D3D12 landing heap and signals copied -> Wait(copied), then the
++//     usual unpack, from the landing heap.
 +// The cross-adapter heaps stay allocated. Guard: at every frame start the CPU reads the check values
 +// of the copies that finished, through the block's mapping (which follows the block wherever the
 +// driver keeps it). A value missing where A wrote it means the block moved: frames go back through
@@ -3596,10 +3733,11 @@ index 0000000..476c628
 +	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
 +	// a_slots: frames in flight (the FFX swap chain's buffer count), 2 or 3.
 +	// a_directCopy: bDirectGPUCopy (needs a_asyncUnpack); falls back to system memory, logged, if it
-+	// cannot be set up.
++	// cannot be set up. a_forceVulkan (iDirectGPUCopyRoute = 1): the Vulkan route even where the display
++	// GPU offers D3D12 GPU upload heaps.
 +	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
 +		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
-+		bool a_directCopy);
++		bool a_directCopy, bool a_forceVulkan);
 +	[[nodiscard]] UINT SlotCount() const noexcept { return slotCount; }
 +
 +	// bDirectGPUCopy carries the frames (set up for every lane, guard not tripped).
@@ -3749,10 +3887,15 @@ index 0000000..476c628
 +		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> mirrorB;
 +		bool mismatchLogged = false;
 +
-+		// bDirectGPUCopy: B's VRAM block as A sees it, B's landing heap, and the block's CPU mapping.
++		// bDirectGPUCopy: B's VRAM block as A sees it, where B reads the lane, and the block's CPU mapping.
 +		// Null/-1 when the lane crosses through system memory only.
++		// D3D12 route: the block is B's own GPU upload heap, read in place. Declared before A's view of it,
++		// so a destructor run closes A's view first, then frees the block (the order that matters at exit).
++		winrt::com_ptr<ID3D12Heap> blockHeapB;
++		winrt::com_ptr<ID3D12Resource> blockB;
 +		winrt::com_ptr<ID3D12Heap> peerHeapA;
 +		winrt::com_ptr<ID3D12Resource> peerStagingA;
++		// Vulkan route: B's landing heap the Vulkan copy fills (the block itself belongs to PeerCopy).
 +		winrt::com_ptr<ID3D12Heap> landingHeapB;
 +		winrt::com_ptr<ID3D12Resource> landingB;
 +		const volatile std::uint8_t* peerMapped = nullptr;
@@ -3836,9 +3979,27 @@ index 0000000..476c628
 +		D3D12_RESOURCE_STATES a_destState, ID3D12Resource* a_source);
 +
 +	// --- bDirectGPUCopy ---------------------------------------------------------------------
-+	// The lane's VRAM block and landing heap (PeerCopy) and A's view of the block. False (logged) when
-+	// any of it fails; the caller then turns the direct copy off.
++	enum class DirectRoute
++	{
++		kNone,
++		kUploadHeap,  // B's D3D12 GPU upload heaps, read in place
++		kVulkan,      // PeerCopy: Vulkan block + per-frame copy into a D3D12 landing heap
++	};
++	// The lane's VRAM block (a GPU upload heap, or PeerCopy's block plus a landing heap) and A's view of
++	// the block. False (logged) when any of it fails; the caller then turns the direct copy off.
 +	bool AddDirectLane(Lane& a_lane, UINT64 a_heapSize);
++	// D3D12 route: the lane's GPU upload heap on B, mapped. False (logged by the caller) on failure.
++	HRESULT CreateUploadHeapBlock(Lane& a_lane, UINT64 a_heapSize, void*& a_mapped);
++	// Where B's unpack reads a directly copied lane: the block (D3D12 route) or the landing heap (Vulkan).
++	static ID3D12Resource* DirectSourceB(const Lane& a_lane) noexcept
++	{
++		return a_lane.blockB ? a_lane.blockB.get() : a_lane.landingB.get();
++	}
++	// Drops every lane's direct-copy resources: A's views first, then B's side. Only with the GPUs idle
++	// (or before any frame ran); a_leaveBlocksToWindows leaks B's GPU upload heaps instead of releasing
++	// them, for an exit where B may still be reading them.
++	void ReleaseDirectLanes(bool a_leaveBlocksToWindows = false) noexcept;
++	[[nodiscard]] const char* DirectRouteName() const noexcept;
 +	// Set-up failure: system memory for the rest of the session, frame generation unaffected.
 +	void DisableDirectCopy();
 +	// The guard: system memory from the next frame on, frame generation off for the session.
@@ -3946,6 +4107,7 @@ index 0000000..476c628
 +	static constexpr UINT64 kCheckStride = 256;  // per lane and slot in the upload buffer; also the space behind the data
 +	std::recursive_timed_mutex frameMutex;  // LockFrame / ReleaseDirectCopyForExit
 +	bool directCopy = false;         // lanes cross through B's VRAM blocks (all set up, guard not tripped)
++	DirectRoute directRoute = DirectRoute::kNone;  // B's side of it, chosen in Initialize
 +	bool directCopyTripped = false;  // the guard tripped this session
 +	bool frameDirect = false;        // the path of the frame being assembled, fixed in PrepareFrame
 +	UINT64 peerValue = 0;            // PeerCopy::Fence() values: landed/copied, two per lane per frame
@@ -4091,7 +4253,7 @@ index 81be80f..d929e2f 100644
  		auto dlssg = StreamlineFG::GetSingleton();
  		dlssg->LoadInterposer();
 diff --git a/plugins/FrameGeneration/src/DX12SwapChain.cpp b/plugins/FrameGeneration/src/DX12SwapChain.cpp
-index e10d528..cafec2a 100644
+index e10d528..67c0665 100644
 --- a/plugins/FrameGeneration/src/DX12SwapChain.cpp
 +++ b/plugins/FrameGeneration/src/DX12SwapChain.cpp
 @@ -1,11 +1,16 @@
@@ -4112,7 +4274,7 @@ index e10d528..cafec2a 100644
  #include "Upscaling.h"
  #include "XeSSFG.h"
  
-@@ -29,6 +34,43 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
+@@ -29,6 +34,44 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
  	REX::INFO("[FG] D3D12 device created");
  }
  
@@ -4145,7 +4307,8 @@ index e10d528..cafec2a 100644
 +		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 +
 +	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-+			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy))
++			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy,
++			upscaling->settings.directGpuCopyRoute == 1))
 +		return fallBack("cross-adapter bridge initialisation failed");
 +
 +	secondaryGPU = true;
@@ -4156,7 +4319,7 @@ index e10d528..cafec2a 100644
  void DX12SwapChain::CreateD3D12CommandQueues()
  {
  	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-@@ -39,18 +81,42 @@ void DX12SwapChain::CreateD3D12CommandQueues()
+@@ -39,18 +82,42 @@ void DX12SwapChain::CreateD3D12CommandQueues()
  
  	DX::ThrowIfFailed(d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue)));
  
@@ -4201,7 +4364,7 @@ index e10d528..cafec2a 100644
  	swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
  	swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
  	swapChainDesc.Format = a_swapChainDesc.BufferDesc.Format;
-@@ -81,34 +147,58 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
+@@ -81,34 +148,58 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAI
  		CreateSwapChainFSR3(a_dxgiFactory, a_swapChainDesc);
  	}
  
@@ -4279,7 +4442,7 @@ index e10d528..cafec2a 100644
  }
  
  void DX12SwapChain::CreateSwapChainDLSSG(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
-@@ -145,9 +235,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
+@@ -145,9 +236,13 @@ bool DX12SwapChain::CreateSwapChainXeSS(IDXGIFactory5* a_dxgiFactory, DXGI_SWAP_
  
  void DX12SwapChain::CreateInterop()
  {
@@ -4295,7 +4458,7 @@ index e10d528..cafec2a 100644
  	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
  	CloseHandle(sharedFenceHandle);
  
-@@ -166,7 +260,7 @@ void DX12SwapChain::CreateInterop()
+@@ -166,7 +261,7 @@ void DX12SwapChain::CreateInterop()
  
  	// Create interop textures
  	if (enbLoaded) {
@@ -4304,7 +4467,7 @@ index e10d528..cafec2a 100644
  	} else {
  		swapChainBufferProxy = new Texture2D(texDesc11);
  
-@@ -179,8 +273,56 @@ void DX12SwapChain::CreateInterop()
+@@ -179,8 +274,56 @@ void DX12SwapChain::CreateInterop()
  		swapChainBufferProxy->CreateSRV(proxySrvDesc);
  	}
  
@@ -4363,7 +4526,7 @@ index e10d528..cafec2a 100644
  }
  
  DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
-@@ -209,8 +351,23 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
+@@ -209,8 +352,23 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
  
  HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  {
@@ -4387,7 +4550,7 @@ index e10d528..cafec2a 100644
  	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
  	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
  	// so presenting HUDLess prevents UI from being warped. UIColorAndAlpha tells DLSS-G
-@@ -239,17 +396,73 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -239,17 +397,73 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11, swapChainBufferProxy->resource.get());
  	}
  
@@ -4466,7 +4629,7 @@ index e10d528..cafec2a 100644
  		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
  		auto dstResource = swapChainBuffers[frameIndex].get();
  
-@@ -282,6 +495,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -282,6 +496,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			useFrameGenerationThisFrame = upscaling->settings.frameGenerationMode && main->gameActive && !menuBlock && !ui->movementToDirectionalCount;
  		}
  	}
@@ -4481,7 +4644,7 @@ index e10d528..cafec2a 100644
  
  	if (upscaling->activeFrameGenType == Upscaling::FrameGenType::kDLSSG) {
  		auto dlssg = StreamlineFG::GetSingleton();
-@@ -358,9 +579,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -358,9 +580,27 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  			xessFrameId++;
  		}
  	} else {
@@ -4510,7 +4673,7 @@ index e10d528..cafec2a 100644
  	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
  
  	// Bracket GPU work submission with render markers
-@@ -370,6 +609,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -370,6 +610,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
  	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
  
@@ -4533,7 +4696,7 @@ index e10d528..cafec2a 100644
  	// XeSS-FG: tag resources AFTER main command list execute (matching sample flow)
  	// Uses the other command list slot for tagging, submitted before Present
  	if (isXeSSFrame && useFrameGenerationThisFrame) {
-@@ -437,6 +692,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -437,6 +693,18 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (!upscaling->highFPSPhysicsFixLoaded && SyncInterval > 0)
  		SyncInterval = 1;
  
@@ -4552,7 +4715,7 @@ index e10d528..cafec2a 100644
  	// Latch UI frame index for the compositor before Streamline's Present
  	// The real Present hook needs to know which UIColorAlpha buffer was last written
  	if (isDLSSGFrame) UICompositor::GetSingleton()->SetUIFrameIndex(frameIndex);
-@@ -445,7 +712,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -445,7 +713,51 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentStart);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_START, xessFrameId - 1);
  
@@ -4604,7 +4767,7 @@ index e10d528..cafec2a 100644
  
  	if (isDLSSGFrame) StreamlineFG::GetSingleton()->SetPCLMarker(sl::PCLMarker::ePresentEnd);
  	if (isXeSSFrame) XeSSFG::GetSingleton()->SetMarker(XELL_PRESENT_END, xessFrameId - 1);
-@@ -454,12 +765,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -454,12 +766,37 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	// was created without DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT —
  	// FSR3/DLSS-G wrapped swap chains manage latency internally)
  	auto frameLatencyWaitableObject = swapChain->GetFrameLatencyWaitableObject();
@@ -4643,7 +4806,7 @@ index e10d528..cafec2a 100644
  	// Clear resources
  	upscaling->Reset();
  
-@@ -472,6 +808,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
+@@ -472,6 +809,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
  	if (SyncInterval == 0 && !upscaling->highFPSPhysicsFixLoaded)
  		upscaling->FrameLimiter(useFrameGenerationThisFrame);
  
@@ -4653,7 +4816,7 @@ index e10d528..cafec2a 100644
  	return S_OK;
  }
  
-@@ -485,6 +824,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
+@@ -485,6 +825,124 @@ HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
  	return swapChain->GetDevice(uuid, ppDevice);
  }
  
@@ -4778,7 +4941,7 @@ index e10d528..cafec2a 100644
  WrappedResource::WrappedResource(D3D11_TEXTURE2D_DESC a_texDesc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)
  {
  	// Create D3D11 shared texture directly instead of wrapping D3D12 resource
-@@ -614,7 +1071,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
+@@ -614,7 +1072,13 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(_Out_opt_ BOOL*
  
  HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(_Out_ DXGI_SWAP_CHAIN_DESC* pDesc)
  {
@@ -6708,10 +6871,10 @@ index 0000000..0f9e801
 +}
 diff --git a/plugins/FrameGeneration/src/PeerCopy.h b/plugins/FrameGeneration/src/PeerCopy.h
 new file mode 100644
-index 0000000..b32351a
+index 0000000..8ca9693
 --- /dev/null
 +++ b/plugins/FrameGeneration/src/PeerCopy.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,76 @@
 +#pragma once
 +
 +// PeerCopy - the display GPU's half of the direct GPU-to-GPU copy (bDirectGPUCopy).
@@ -6720,6 +6883,10 @@ index 0000000..b32351a
 +// block of its VRAM for the CPU through its resizable BAR, and the render GPU's D3D12 device opens that
 +// CPU address with OpenExistingHeapFromAddress as if it were system memory. Its writes then cross PCIe
 +// once, card to card, and never touch system RAM (the cross-adapter heap costs two trips through it).
++//
++// This is the Vulkan route (iDirectGPUCopyRoute = 1, and the automatic choice where the display GPU's
++// D3D12 has no GPU upload heaps). Where it has them (Windows 11 24H2+), CrossAdapterBridge creates the
++// blocks as D3D12 GPU upload heaps itself and this class is not used.
 +//
 +// On Windows 10, D3D12 cannot create VRAM the CPU can map on a discrete GPU (GPU upload heaps need
 +// Windows 11 24H2), and AMD's Vulkan driver does not export CPU-mappable VRAM to D3D12. So this class
@@ -8280,7 +8447,7 @@ index 0000000..5ab035f
 +	LARGE_INTEGER statLastLog{};
 +};
 diff --git a/plugins/FrameGeneration/src/Upscaling.cpp b/plugins/FrameGeneration/src/Upscaling.cpp
-index 3483d96..b92dafe 100644
+index 3483d96..a200d50 100644
 --- a/plugins/FrameGeneration/src/Upscaling.cpp
 +++ b/plugins/FrameGeneration/src/Upscaling.cpp
 @@ -1,9 +1,40 @@
@@ -8343,7 +8510,7 @@ index 3483d96..b92dafe 100644
  		REX::WARN("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
  		if (shaderErrors) shaderErrors->Release();
  		if (shaderBlob) shaderBlob->Release();
-@@ -120,17 +152,35 @@ void Upscaling::LoadSettings()
+@@ -120,17 +152,36 @@ void Upscaling::LoadSettings()
  {
  	CSimpleIniA ini;
  	ini.SetUnicode();
@@ -8386,10 +8553,11 @@ index 3483d96..b92dafe 100644
 +	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
 +	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
 +	settings.directGpuCopy = ini.GetBoolValue(section, "bDirectGPUCopy", false);
++	settings.directGpuCopyRoute = std::clamp(static_cast<int>(ini.GetLongValue(section, "iDirectGPUCopyRoute", 0)), 0, 1);
  
  	static bool loggedOnce = false;
  	if (!loggedOnce) {
-@@ -138,6 +188,28 @@ void Upscaling::LoadSettings()
+@@ -138,6 +189,31 @@ void Upscaling::LoadSettings()
  		REX::INFO("[Frame Generation] bFrameLimitMode: {}", settings.frameLimitMode);
  		REX::INFO("[Frame Generation] iFrameGenType: {} (0=FSR3, 1=DLSS-G, 2=XeSS-FG)", settings.frameGenType);
  		REX::INFO("[Frame Generation] iFrameGenFrames: {} (1=2x, 2=3x MFG, 3=4x MFG)", settings.frameGenFrames);
@@ -8415,10 +8583,13 @@ index 3483d96..b92dafe 100644
 +		REX::INFO("[Frame Generation] bDirectGPUCopy: {} (second-GPU mode, experimental: the render GPU writes straight into "
 +				  "the display GPU's VRAM instead of through system memory)",
 +			settings.directGpuCopy);
++		REX::INFO("[Frame Generation] iDirectGPUCopyRoute: {} (0=D3D12 GPU upload heaps when the display GPU offers them, "
++				  "else Vulkan; 1=Vulkan)",
++			settings.directGpuCopyRoute);
  		loggedOnce = true;
  	}
  }
-@@ -169,8 +241,33 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -169,8 +245,33 @@ void Upscaling::CreateFrameGenerationResources()
  
  	auto rendererData = RE::BSGraphics::GetRendererData();
  	auto& main = rendererData->renderTargets[(uint)RenderTarget::kMain];
@@ -8453,7 +8624,7 @@ index 3483d96..b92dafe 100644
  		D3D11_TEXTURE2D_DESC texDesc{};
  		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
  		D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
-@@ -193,6 +290,9 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -193,6 +294,9 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -8463,7 +8634,7 @@ index 3483d96..b92dafe 100644
  
  		HUDLessBufferShared[index] = new Texture2D(texDesc);
  		HUDLessBufferShared[index]->CreateSRV(srvDesc);
-@@ -204,6 +304,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -204,6 +308,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -8474,7 +8645,7 @@ index 3483d96..b92dafe 100644
  		depthBufferShared[index] = new Texture2D(texDesc);
  		depthBufferShared[index]->CreateSRV(srvDesc);
  		depthBufferShared[index]->CreateRTV(rtvDesc);
-@@ -218,6 +322,10 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -218,6 +326,10 @@ void Upscaling::CreateFrameGenerationResources()
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
  
@@ -8485,7 +8656,7 @@ index 3483d96..b92dafe 100644
  		motionVectorBufferShared[index] = new Texture2D(texDesc);
  		motionVectorBufferShared[index]->CreateSRV(srvDesc);
  		motionVectorBufferShared[index]->CreateRTV(rtvDesc);
-@@ -228,14 +336,14 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -228,14 +340,14 @@ void Upscaling::CreateFrameGenerationResources()
  		srvDesc.Format = texDesc.Format;
  		rtvDesc.Format = texDesc.Format;
  		uavDesc.Format = texDesc.Format;
@@ -8502,7 +8673,7 @@ index 3483d96..b92dafe 100644
  		{
  			IDXGIResource1* dxgiResource = nullptr;
  			DX::ThrowIfFailed(HUDLessBufferShared[index]->resource->QueryInterface(IID_PPV_ARGS(&dxgiResource)));
-@@ -248,7 +356,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -248,7 +360,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -8511,7 +8682,7 @@ index 3483d96..b92dafe 100644
  					sharedHandle,
  					IID_PPV_ARGS(&HUDLessBufferShared12[index])));
  
-@@ -268,7 +376,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -268,7 +380,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -8520,7 +8691,7 @@ index 3483d96..b92dafe 100644
  					sharedHandle,
  					IID_PPV_ARGS(&depthBufferShared12[index])));
  
-@@ -288,7 +396,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -288,7 +400,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -8529,7 +8700,7 @@ index 3483d96..b92dafe 100644
  					sharedHandle,
  					IID_PPV_ARGS(&motionVectorBufferShared12[index])));
  
-@@ -308,7 +416,7 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -308,7 +420,7 @@ void Upscaling::CreateFrameGenerationResources()
  					nullptr,
  					&sharedHandle));
  
@@ -8538,7 +8709,7 @@ index 3483d96..b92dafe 100644
  					sharedHandle,
  					IID_PPV_ARGS(&UIColorAlphaShared12[index])));
  
-@@ -317,17 +425,141 @@ void Upscaling::CreateFrameGenerationResources()
+@@ -317,17 +429,141 @@ void Upscaling::CreateFrameGenerationResources()
  		}
  	}
  
@@ -8683,7 +8854,7 @@ index 3483d96..b92dafe 100644
  	
  	auto& colorMain = rendererData->renderTargets[(uint)RenderTarget::kMain];
  	auto& colorPostAlpha = rendererData->renderTargets[(uint)RenderTarget::kMainTemp];
-@@ -358,10 +590,16 @@ void Upscaling::PostAlpha()
+@@ -358,10 +594,16 @@ void Upscaling::PostAlpha()
  		auto& depth = rendererData->depthStencilTargets[(uint)DepthStencilTarget::kMain];
  
  		{
@@ -8704,7 +8875,7 @@ index 3483d96..b92dafe 100644
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPreAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(colorPostAlpha.srView),
  				reinterpret_cast<ID3D11ShaderResourceView*>(motionVector.srView),
-@@ -373,12 +611,12 @@ void Upscaling::PostAlpha()
+@@ -373,12 +615,12 @@ void Upscaling::PostAlpha()
  			ID3D11UnorderedAccessView* uavs[2] = { motionVectorBufferShared[dx12SwapChain->frameIndex]->uav.get(), depthBufferShared[dx12SwapChain->frameIndex]->uav.get()};
  			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
  
@@ -8719,7 +8890,7 @@ index 3483d96..b92dafe 100644
  		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
  
  		ID3D11UnorderedAccessView* uavs[2] = { nullptr, nullptr };
-@@ -387,6 +625,108 @@ void Upscaling::PostAlpha()
+@@ -387,6 +629,108 @@ void Upscaling::PostAlpha()
  		ID3D11ComputeShader* shader = nullptr;
  		context->CSSetShader(shader, nullptr, 0);
  	}
@@ -8828,7 +8999,7 @@ index 3483d96..b92dafe 100644
  }
  
  void Upscaling::CopyBuffersToSharedResources()
-@@ -401,18 +741,66 @@ void Upscaling::CopyBuffersToSharedResources()
+@@ -401,18 +745,66 @@ void Upscaling::CopyBuffersToSharedResources()
  
  	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
  	auto dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -8900,7 +9071,7 @@ index 3483d96..b92dafe 100644
  
  
  			ID3D11ShaderResourceView* views[1] = { reinterpret_cast<ID3D11ShaderResourceView*>(depth.srViewDepth) };
-@@ -558,22 +946,124 @@ void Upscaling::PostDisplay()
+@@ -558,22 +950,124 @@ void Upscaling::PostDisplay()
  	if (!setupBuffers)
  		CreateFrameGenerationResources();
  
@@ -9031,7 +9202,7 @@ index 3483d96..b92dafe 100644
  
  void Upscaling::GenerateUIBuffer()
 diff --git a/plugins/FrameGeneration/src/Upscaling.h b/plugins/FrameGeneration/src/Upscaling.h
-index 838f927..4f90664 100644
+index 838f927..8af9326 100644
 --- a/plugins/FrameGeneration/src/Upscaling.h
 +++ b/plugins/FrameGeneration/src/Upscaling.h
 @@ -1,6 +1,7 @@
@@ -9042,7 +9213,7 @@ index 838f927..4f90664 100644
  
  #include "SimpleIni.h"
  
-@@ -23,29 +24,87 @@ public:
+@@ -23,29 +24,88 @@ public:
  		bool debugLogging = false;
  		int frameGenType = 0;    // 0=FSR3, 1=DLSS-G, 2=XeSS-FG
  		int frameGenFrames = 1;  // 1=2x, 2=3x, 3=4x (MFG, RTX 50+ only)
@@ -9062,6 +9233,7 @@ index 838f927..4f90664 100644
 +		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
 +		bool extraFrameInFlight = false; ///< Second-GPU mode: 3 swap-chain buffers instead of 2 (FrameSlots.h); restart
 +		bool directGpuCopy = false;      ///< Second-GPU mode: the render GPU writes into the display GPU's VRAM (PeerCopy.h); restart
++		int directGpuCopyRoute = 0;      ///< bDirectGPUCopy's display-GPU side: 0 = D3D12 GPU upload heaps when offered (Win11 24H2+), else Vulkan; 1 = Vulkan; restart
  	};
  
  	Settings settings;
@@ -9138,7 +9310,7 @@ index 838f927..4f90664 100644
  
  	bool setupBuffers = false;
  
-@@ -57,9 +116,14 @@ public:
+@@ -57,9 +117,14 @@ public:
  	void PostPostLoad();
  
  	void CreateFrameGenerationResources();

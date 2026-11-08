@@ -53,14 +53,14 @@ to this repository they are at the root, and the paths below are relative to it.
 | `tools/presentmon-capture.ps1`, `tools/presentmon-summary.ps1` | Frame-pacing A/B: record a PresentMon capture of the game, and compare captures (on-screen time, jitter, 1% low, frame types, present mode) |
 | `tools/bridge-load/` | Standalone D3D12 load generator: replays the bridge's host-memory traffic (77 MB up + 77 MB down per frame) on one GPU, to A/B whether that traffic costs the game fps |
 | `tools/save-runs.ps1` | Keeps each game run's `MGPUScaling.log`, `ReShade.log` and MCM settings in `D:\fgb\runs\<time>-direct<0|1>-<hdr|sdr>` for back-to-back A/B runs (the logs are overwritten on every start) |
-| `tools/p2p-probe/` | Standalone test bed for `bDirectGPUCopy`: can the 3090 write into the 9060's VRAM, how fast in every direction, how the 9060's D3D12 can read it, does the block move under VRAM pressure, and the mod's per-frame sequence 300 times |
+| `tools/p2p-probe/` | Standalone test bed for `bDirectGPUCopy`: can the 3090 write into the 9060's VRAM, how fast in every direction, how the 9060's D3D12 can read it, does the block move under VRAM pressure, and the mod's per-frame sequence 300 times; `--upload-heap` does it all with D3D12 GPU upload heaps and no Vulkan (Windows 11) |
 | `SESSION-NOTES.md` | Session handoff: measurements, findings, next steps |
 | `plans/` | Planned work not started yet: `UI-TILES.md` (freeze the HUD with a motion-vector mask, then send only the UI tiles of the finished frame), `DISPLAY-THREAD.md` (FFX Present on its own thread) |
 | `.github/workflows/build.yml` | GitHub Actions build (manual only) |
 
 The changes:
 - `CrossAdapterBridge.h/.cpp` are new: adapter choice, cross-adapter heaps and fences, the copy queue, unpacking, stats.
-- `PeerCopy.h/.cpp` are new: the 9060's Vulkan side of `bDirectGPUCopy` (CPU-visible VRAM blocks the 3090 writes into, the copy into D3D12 landing heaps, the shared fence).
+- `PeerCopy.h/.cpp` are new: the 9060's Vulkan side of `bDirectGPUCopy` (CPU-visible VRAM blocks the 3090 writes into, the copy into D3D12 landing heaps, the shared fence). The D3D12 route (GPU upload heaps, Windows 11) needs none of it and lives in `CrossAdapterBridge` (`CreateUploadHeapBlock`).
 - `SecondaryUpscale.h/.cpp` and `SecondaryUpscaleCS.hlsl` are new: FSR 4.1 upscaling and the UI composite on the second GPU, and the conversion into a swap chain an HDR add-on changed (on the second GPU, or on the game's GPU in single-GPU mode).
 - `DX11Hooks.cpp`, `DX12SwapChain.*`, `FidelityFX.*`, `Upscaling.*` are small edits.
 - `plugins/MGPUScaling/src/upscaler/` is FO4Upscaling's `Upscaling` plugin, wrapped in `namespace up` (its classes have the same names as the frame-generation part's) and patched: upscale method 3 renders for the second GPU's FSR 4.1. Its entry point is `Upscaler.cpp`.
@@ -121,6 +121,7 @@ bEarlyUnpack = 1             ; 1 = the 9060 reads them as they land, before Pres
 iHalfResDepthMV = 1          ; 0 = full res; 1 = half-res depth, rebuilt on the 9060 (default); 2 = half-res depth + MVs
 bExtraFrameInFlight = 0      ; 1 = 3 frames in flight instead of 2: more throughput when the chain, not the 3090, limits; +1 frame latency (restart)
 bDirectGPUCopy = 0           ; 1 = EXPERIMENTAL: the 3090 writes straight into the 9060's VRAM, no system RAM; guarded (restart)
+iDirectGPUCopyRoute = 0      ; 0 = D3D12 GPU upload heaps when the 9060 offers them (Win11 24H2+), else Vulkan; 1 = Vulkan (restart)
 iFrameGenType = 0            ; ignored in GPU1 mode (always FSR3)
 iFSRRuntime = 1              ; 0 = FidelityFX SDK 1.1.4 (FSR 3.1.4); 1 = FSR SDK 2.4, newest provider offered (default)
 iFSRSwapChainProvider = 0    ; SDK 2.4: 0 = newest swap chain (4.0.0 on RX 9000); 1 = newest 3.x (3.1.7), for A/B
@@ -506,15 +507,30 @@ duty at 38 Hz. For other settings, payload MB × game fps × 2 ≈ GB/s of DRAM 
 Off by default. With it on, the 3090 writes each lane **straight into the 9060's VRAM**: one PCIe
 trip instead of two, and none of the payload touches system RAM.
 
-How: the 9060 has Resizable BAR on, so its whole VRAM can be mapped for the CPU. A small Vulkan
-device on the 9060 (`PeerCopy`) allocates one such block per lane and maps it; the 3090's D3D12
-device opens that CPU address with `OpenExistingHeapFromAddress` as if it were system memory, and
-its copy engine's writes then go over PCIe to the 9060. No driver documents this; both simply
-accept the address. The 9060's D3D12 device (FFX) cannot see Vulkan's block on Windows 10, so the
-9060's Vulkan copies each lane from the block into a D3D12 heap it imported (local VRAM, ~150 GB/s,
-~0.2 ms for the 33 MB finished frame), and the usual unpack reads from there. A D3D12 fence imported
-into Vulkan as a timeline semaphore orders the two per lane: the copy queue signals "landed" once
-the 3090's transfer fence passes, Vulkan copies and signals "copied", the copy queue unpacks.
+How: the 9060 has Resizable BAR on, so its whole VRAM can be mapped for the CPU. The 9060 maps one
+block of VRAM per lane; the 3090's D3D12 device opens that CPU address with
+`OpenExistingHeapFromAddress` as if it were system memory, and its copy engine's writes then go over
+PCIe to the 9060. No driver documents this; both simply accept the address. Who owns the block on
+the 9060 is `iDirectGPUCopyRoute`:
+
+- **D3D12 GPU upload heaps** (`0`, automatic, used when the 9060's D3D12 offers them: Windows 11
+  24H2 or newer with driver support). The 9060's own D3D12 device creates each block as a
+  `D3D12_HEAP_TYPE_GPU_UPLOAD` heap (VRAM the CPU can map) and maps it; its copy queue unpacks
+  straight out of the block once the 3090's transfer fence passes, like the system-memory path. No
+  Vulkan in the game process, no extra copy, half the VRAM of the Vulkan route.
+- **Vulkan** (`1`, and the automatic choice where there are no GPU upload heaps, e.g. Windows 10,
+  where D3D12 cannot map VRAM at all). A small Vulkan device on the 9060 (`PeerCopy`) owns the
+  blocks. The 9060's D3D12 device (FFX) cannot see them, so the 9060's Vulkan copies each lane from
+  the block into a D3D12 heap it imported (the "landing heap", local VRAM, ~150 GB/s, ~0.2 ms for the
+  33 MB finished frame on Windows 10), and the usual unpack reads from there. A D3D12 fence imported
+  into Vulkan as a timeline semaphore orders the two per lane: the copy queue signals "landed" once
+  the 3090's transfer fence passes, Vulkan copies and signals "copied", the copy queue unpacks.
+
+`tools/p2p-probe --upload-heap` tested the D3D12 route on this PC under Windows 11 without Vulkan:
+the 3090 writes the 9060's upload heap at 10.2 GB/s (the same as the Vulkan block), the 9060 reads it
+at VRAM speed (33.2 MB in 0.41 ms on its copy queue, 0.25 ms on its direct queue), 300 frames with
+the 9060's read queued before the 3090 wrote had no wrong data on either queue, and the check value
+was visible through the mapping the moment the 3090's fence completed.
 
 | 77 MB FSR 4.1 payload (p2p-probe `--bench`) | system memory | direct |
 |---|---|---|
@@ -530,8 +546,10 @@ step was tried first with `tools/p2p-probe` on this PC, including the mod's per-
 times with the 9060's work queued before the 3090 writes (0 wrong frames).
 
 **Guard.** The danger is the 9060's driver moving a block while the 3090 still writes to its old
-address. Under 19.5 GB of VRAM pressure on the 16 GB card the blocks did not move (`--evict`), and
-they get Vulkan's highest memory priority; the guard covers the rest. The 3090 writes a check value
+address. Under 19.5 GB of VRAM pressure on the 16 GB card the blocks did not move (`--evict` for the
+Vulkan block on Windows 10, `--upload-heap --evict` for the GPU upload heap on Windows 11), and they
+get the highest residency priority (Vulkan memory priority 1.0, or D3D12's
+`D3D12_RESIDENCY_PRIORITY_MAXIMUM`); the guard covers the rest. The 3090 writes a check value
 (the lane's transfer number) behind each lane's data; at every frame start the CPU reads the values
 of the copies that finished, through the block's CPU mapping, which follows the block wherever the
 driver keeps it (one uncached read per lane, ~1–2 µs). If a value is missing where the 3090 wrote it,
@@ -552,26 +570,42 @@ flight, closes the 3090's views, then frees the blocks, and logs it. The render 
 for each frame's bridge work, so this never lands mid-frame. The hooks are only installed when the
 entry points start with known prologue instructions (the detour library cannot relocate RIP-relative
 ones); if they cannot be installed, the direct copy stays off. After the plugin's own DLL detach
-has begun, nothing calls into the Vulkan driver any more.
+has begun, nothing calls into the Vulkan driver any more. On the D3D12 route the same order holds:
+the 3090's views close first, then the 9060's upload heaps are freed; if the GPUs are still busy
+after 2 s, the heaps are left to Windows' process teardown rather than freed under the 9060.
 
-Needs `bAsyncUnpack = 1`, Resizable BAR (Smart Access Memory) on the 9060 and its Vulkan driver.
-If any of it is missing, or any setup step fails, the log says which and the frames go through
-system memory as before, with frame generation unaffected. Costs ~2× the payload × frames in flight
-of extra VRAM on the 9060 (block + landing heap; ~460 MB at 4K FSR 4.1 Quality with 3 frames in
-flight). Not tested: sleep/resume or a driver reset while the game runs.
+Needs `bAsyncUnpack = 1`, Resizable BAR (Smart Access Memory) on the 9060, and either D3D12 GPU
+upload heaps or its Vulkan driver. If any of it is missing, or any setup step fails, the log says
+which and the frames go through system memory as before, with frame generation unaffected. Extra
+VRAM on the 9060: the payload × frames in flight on the D3D12 route (~230 MB at 4K FSR 4.1 Quality
+with 3 frames in flight), twice that on the Vulkan route (block + landing heap, ~460 MB). Not
+tested: sleep/resume or a driver reset while the game runs.
+
+D3D12 route:
 
 ```
 [Frame Generation] bDirectGPUCopy: true (...)
-[FG-GPU1] direct GPU copy: Vulkan 1.4.x on "AMD Radeon RX 9060 XT", async compute queue (family 1), memory priority on, timestamps on
-[FG-GPU1] bridge ready: render GPU copy queue -> the display GPU's VRAM, directly (bDirectGPUCopy=1) -> display GPU copy queue, lane by lane (bAsyncUnpack=1)
-[FG-GPU1] direct GPU copy: lane 'final frame': 95.1 MB VRAM block (CPU-visible, mapped at 0x...) + 95.1 MB landing heap on the display GPU
+[Frame Generation] iDirectGPUCopyRoute: 0 (0=D3D12 GPU upload heaps when the display GPU offers them, else Vulkan; 1=Vulkan)
+[FG-GPU1] direct GPU copy: D3D12 GPU upload heaps on the display GPU (its VRAM, mapped by its own D3D12 device); its copy queue reads each lane in place. No Vulkan
+[FG-GPU1] bridge ready: render GPU copy queue -> the display GPU's VRAM, directly (bDirectGPUCopy=1, D3D12 GPU upload heaps) -> display GPU copy queue, lane by lane (bAsyncUnpack=1)
+[FG-GPU1] direct GPU copy: lane 'final frame': 95.1 MB GPU upload heap on the display GPU (VRAM, CPU-visible, mapped at 0x...), read in place
 [FG-GPU1] lane[0] 'final frame' 3840x2160 ... (direct to the display GPU's VRAM)
+...every 10 s:
+[FG-GPU1] direct GPU copy: 660/660 frames into the display GPU's VRAM (D3D12 GPU upload heaps, read in place) | check values found 2640 (late 0)
+```
+
+Vulkan route (Windows 10, or `iDirectGPUCopyRoute = 1`):
+
+```
+[FG-GPU1] direct GPU copy: Vulkan route (the display GPU's D3D12 offers no GPU upload heaps; ...)
+[FG-GPU1] direct GPU copy: Vulkan 1.4.x on "AMD Radeon RX 9060 XT", async compute queue (family 1), memory priority on, timestamps on
+[FG-GPU1] direct GPU copy: lane 'final frame': 95.1 MB VRAM block (CPU-visible, mapped at 0x...) + 95.1 MB landing heap on the display GPU
 ...every 10 s:
 [FG-GPU1] direct GPU copy: 660/660 frames into the display GPU's VRAM | its Vulkan copy into the landing heaps (async compute queue) avg 0.5 ms ... | check values found 2640 (late 0)
 ```
 
 (Expected lines, not a capture.) The 10 s line's `copy on render GPU` then shows the card-to-card
-rate (~10 GB/s), and `display GPU: unpack` the local copy out of the landing heap.
+rate (~10 GB/s), and `display GPU: unpack` the local read out of the upload heap or landing heap.
 
 ## Known risks / first things to check
 
@@ -581,7 +615,7 @@ rate (~10 GB/s), and `display GPU: unpack` the local copy out of the landing hea
   `[FSR] generating a frame failed`, stutter, a crash), set `iFSRRuntime = 0` to go back to
   exactly the previous behaviour.
 
-- **`bDirectGPUCopy` is new.** First in-game run (2026-11-08, CS, ReShade AutoHDR, FSR 4.1 Quality, 3 frames in flight): every frame crossed directly at the 70.9 fps cap, check values never late, but **Alt+F4 hung the PC** (no bugcheck, power button). The first build freed the 9060's VRAM blocks in its destructors, after the drivers had started unloading and while the 3090 still had them open. The current build releases them in the right order before anything unloads (see "At exit" in [Direct GPU-to-GPU copy](#direct-gpu-to-gpu-copy-bdirectgpucopy-experimental)); `tools/p2p-probe --exit-gpu` checks that with copies in flight. Not yet re-tested in game: after quitting, the log should end with `direct GPU copy: the game is exiting; closed the render GPU's views ...`. If frame generation turns itself off, look for `direct GPU copy guard`; for anything else odd, set it back to 0. It creates a Vulkan instance in the game process with implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~` while it is created), so overlays' Vulkan layers stay out.
+- **`bDirectGPUCopy` is new.** First in-game run (2026-11-08, CS, ReShade AutoHDR, FSR 4.1 Quality, 3 frames in flight): every frame crossed directly at the 70.9 fps cap, check values never late, but **Alt+F4 hung the PC** (no bugcheck, power button). The first build freed the 9060's VRAM blocks in its destructors, after the drivers had started unloading and while the 3090 still had them open. The current build releases them in the right order before anything unloads (see "At exit" in [Direct GPU-to-GPU copy](#direct-gpu-to-gpu-copy-bdirectgpucopy-experimental)); `tools/p2p-probe --exit-gpu` checks that with copies in flight. Not yet re-tested in game: after quitting, the log should end with `direct GPU copy: the game is exiting; closed the render GPU's views ...`. If frame generation turns itself off, look for `direct GPU copy guard`; for anything else odd, set it back to 0. On the Vulkan route it creates a Vulkan instance in the game process with implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~` while it is created), so overlays' Vulkan layers stay out; the D3D12 route (Windows 11 default) creates none. Since 2026-11-09 clean exits are logged in game (`the game is terminating itself; closed the render GPU's views ...`), on the Vulkan route and on the D3D12 route (first in-game run 2026-11-09: every frame direct, check values never late, 61-71 game fps doubled, clean exit).
 - **Cross-adapter heap 3090 → 9060 XT.** MGPU Bridge proved AMD → NVIDIA. This direction should work the same way, and if it fails the code tries the reverse automatically. If both fail, the log shows the HRESULT and frame generation stays on the 3090.
 - **A failure after startup is not recovered.** Once the bridge is up, the first failed HRESULT — including the 2 s timeout waiting for the previous frame's copy if the secondary GPU's queue stalls — disables the transport for the rest of the session. `secondaryGPU` stays selected, so the game keeps running but no new frame reaches the screen (`CRITICAL [FG-GPU1] transport is down`). Restart the game; there is no automatic single-GPU fallback after this point.
 - **HDR add-ons are followed at startup only.** A swap-chain format set while FFX creates it is handled (previous section); one changed later (HDR toggled in game) is not seen and needs a restart. The finished-frame copy refuses formats it cannot copy into (it used to compare only size and row pitch, which 8-bit and 10-bit share), so if the conversion is not set up for some reason the screen stays black and the log has `lane 'final frame' is ... format 28 but its destination is ... format 24; skipping the copy`. In single-GPU mode a conversion that could not be set up is logged as an `[FG]` error and the plain copy stays (wrong colours, as before this version).

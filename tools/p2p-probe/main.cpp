@@ -13,6 +13,7 @@
 //   --interop   which way the AMD D3D12 device can use the block (bDirectGPUCopy uses route 3)
 //   --evict     --interop, then VRAM pressure on the AMD GPU: does the block keep its address?
 //   --pipeline  the mod's per-frame sequence 300 times, the AMD side queued before the NVIDIA write
+//   --upload-heap  all of it with D3D12 GPU upload heaps on the AMD GPU and no Vulkan (Windows 11 24H2+)
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -1897,8 +1898,242 @@ namespace
 }
 #endif
 
+// ---- --upload-heap: the direct copy with D3D12 alone (Windows 11 24H2+) ------------------------------------------
+//
+// D3D12 GPU upload heaps (D3D12_HEAP_TYPE_GPU_UPLOAD) are VRAM that D3D12 itself maps for the CPU through the
+// resizable BAR. Windows 10 has none, which is why bDirectGPUCopy keeps a Vulkan device on the 9060 (route 3: a
+// Vulkan block the 3090 writes, a Vulkan copy into a D3D12 landing heap every frame). If the 9060's D3D12 device
+// offers them, it can own the block and read it directly: no Vulkan, no landing heap, no per-frame Vulkan copy.
+//
+// Checked, all without Vulkan: support on both GPUs; a GPU upload heap on the 9060, mapped; the 3090 opening that
+// mapping (OpenExistingHeapFromAddress); 4 rounds of new data the 9060's copy and direct queues and the CPU read;
+// speed both ways at the 4K finished frame's size; then the mod's per-frame sequence a_rounds times with the
+// 9060's read QUEUED BEFORE the 3090 writes (the gate opens 2 ms later from another thread), alternating the
+// copy and direct queues, so stale GPU caches would show up as wrong frames; and whether the check value behind
+// the frame is visible through the mapping when the 3090's fence completes. With a_evict, the --evict pressure
+// test on the upload heap at default and maximum residency priority.
+namespace
+{
+	int RunUploadHeap(uint32_t a_rounds, bool a_evict)
+	{
+		constexpr UINT64 kLane = 33'177'600ull;  // the 4K finished frame
+		constexpr UINT64 kCheckOffset = kLane;   // 256-aligned, inside the 64 MiB block
+		constexpr uint32_t kSeeds[2] = { 0x6B0A0000u, 0x6B0AFFFFu };
+		Dx a;
+		Dx b;
+		if (!a.Create(kVendorNvidia) || !b.Create(kVendorAmd)) {
+			std::printf("  D3D12 devices failed\n");
+			return 1;
+		}
+		for (Dx* dx : { &a, &b }) {
+			D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
+			const HRESULT hr = dx->dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof o16);
+			std::printf("  %s GPU upload heaps: query 0x%08lx, supported %d\n", dx == &a ? "3090" : "9060",
+				static_cast<unsigned long>(hr), SUCCEEDED(hr) ? o16.GPUUploadHeapSupported : 0);
+			if (dx == &b && (FAILED(hr) || !o16.GPUUploadHeapSupported)) {
+				std::printf("  => the 9060 offers no GPU upload heaps; D3D12 cannot own the block here\n");
+				return 1;
+			}
+		}
+
+		// One heap per lane in the mod; one 64 MiB heap here, with a buffer placed at 0 and mapped.
+		D3D12_HEAP_DESC hd{};
+		hd.SizeInBytes = kSize;
+		hd.Properties.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
+		hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+		ComPtr<ID3D12Heap> heapB;
+		HRESULT hr = b.dev->CreateHeap(&hd, IID_PPV_ARGS(&heapB));
+		std::printf("  9060 creates a 64 MiB GPU upload heap: 0x%08lx\n", static_cast<unsigned long>(hr));
+		if (FAILED(hr)) return 1;
+		PrintHeap(heapB.Get());
+		ComPtr<ID3D12Resource> blockB = b.Placed(heapB.Get());
+		void* ptr = nullptr;
+		hr = blockB ? blockB->Map(0, nullptr, &ptr) : E_FAIL;
+		std::printf("  9060 maps it: 0x%08lx, CPU pointer %p\n", static_cast<unsigned long>(hr), ptr);
+		if (FAILED(hr) || !ptr) return 1;
+
+		ComPtr<ID3D12Heap> heapA;
+		hr = a.dev->OpenExistingHeapFromAddress(ptr, IID_PPV_ARGS(&heapA));
+		std::printf("  3090 opens the mapping (OpenExistingHeapFromAddress): 0x%08lx\n", static_cast<unsigned long>(hr));
+		if (FAILED(hr)) return 1;
+		PrintHeap(heapA.Get());
+		ComPtr<ID3D12Resource> peerOnA = a.Placed(heapA.Get());
+		ComPtr<ID3D12Resource> vramA = a.Buffer(D3D12_HEAP_TYPE_DEFAULT, kSize, D3D12_RESOURCE_STATE_COMMON);
+		ComPtr<ID3D12Resource> vramB = b.Buffer(D3D12_HEAP_TYPE_DEFAULT, kSize, D3D12_RESOURCE_STATE_COMMON);
+		if (!peerOnA || !vramA || !vramB) return 1;
+
+		std::printf("\n  4 rounds: the 3090 writes new data, the 9060 reads it straight from its upload heap\n");
+		bool roundsOk = true;
+		for (uint32_t round = 0; round < 4; ++round) {
+			const uint32_t seed = 0x6B0B0000u + round;
+			std::printf("    round %u\n", round + 1);
+			if (!a.Fill(vramA.Get(), seed) || !a.CopyOnce(a.copy, peerOnA.Get(), vramA.Get())) return 1;
+			roundsOk &= b.Verify(b.copy, blockB.Get(), seed, "9060 copy queue reads the upload heap");
+			roundsOk &= b.Verify(b.direct, blockB.Get(), seed, "9060 direct queue reads the upload heap");
+			SampleBar("CPU reads it through the 9060's mapping", ptr, seed);
+		}
+
+		std::printf("\n  speed, %u copies of the 33.2 MB finished frame\n", kReps);
+		const double write = a.Time(a.copy, peerOnA.Get(), vramA.Get(), kLane, kReps);
+		const double readCopy = b.Time(b.copy, vramB.Get(), blockB.Get(), kLane, kReps);
+		const double readDirect = b.Time(b.direct, vramB.Get(), blockB.Get(), kLane, kReps);
+		const auto gbs = [&](double a_ms) { return a_ms > 0 ? static_cast<double>(kLane) / (a_ms / 1000.0) / 1e9 : 0.0; };
+		std::printf("    3090 copy queue writes the 9060's upload heap: %.2f ms (%.1f GB/s)\n", write, gbs(write));
+		std::printf("    9060 copy queue reads it into VRAM:            %.2f ms (%.1f GB/s)\n", readCopy, gbs(readCopy));
+		std::printf("    9060 direct queue reads it into VRAM:          %.2f ms (%.1f GB/s)\n", readDirect, gbs(readDirect));
+
+		// The per-frame sequence. 3090 copy queue: wait for the gate, write the frame + check value, signal the
+		// cross-adapter transfer fence. 9060: wait for that fence on the GPU, read the frame into VRAM (the mod's
+		// unpack), signal done. All of the 9060's side is submitted before the gate opens.
+		ComPtr<ID3D12Fence> transferA;
+		ComPtr<ID3D12Fence> transferB;
+		ComPtr<ID3D12Fence> gate;
+		ComPtr<ID3D12Fence> doneB;
+		{
+			HANDLE handle = nullptr;
+			if (FAILED(a.dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER,
+					IID_PPV_ARGS(&transferA))) ||
+				FAILED(a.dev->CreateSharedHandle(transferA.Get(), nullptr, GENERIC_ALL, nullptr, &handle)) ||
+				FAILED(b.dev->OpenSharedHandle(handle, IID_PPV_ARGS(&transferB))) ||
+				FAILED(a.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))) ||
+				FAILED(b.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&doneB)))) {
+				std::printf("  fences failed\n");
+				return 1;
+			}
+			CloseHandle(handle);
+		}
+		ComPtr<ID3D12Resource> src[2];
+		for (int i = 0; i < 2; ++i) {
+			src[i] = a.Buffer(D3D12_HEAP_TYPE_DEFAULT, kSize, D3D12_RESOURCE_STATE_COMMON);
+			if (!src[i] || !a.Fill(src[i].Get(), kSeeds[i])) return 1;
+		}
+		ComPtr<ID3D12Resource> checkUpload = a.Buffer(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_STATE_GENERIC_READ);
+		UINT64* checkCpu = nullptr;
+		checkUpload->Map(0, nullptr, reinterpret_cast<void**>(&checkCpu));
+		const auto* checkGpu = reinterpret_cast<const volatile UINT64*>(static_cast<const uint8_t*>(ptr) + kCheckOffset);
+		HANDLE doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+		LARGE_INTEGER f;
+		QueryPerformanceFrequency(&f);
+		auto us = [&](const LARGE_INTEGER& a_from, const LARGE_INTEGER& a_to) {
+			return static_cast<double>(a_to.QuadPart - a_from.QuadPart) * 1e6 / static_cast<double>(f.QuadPart);
+		};
+		uint32_t wrong[2] = {};
+		uint32_t checkLate = 0;
+		uint32_t checkNever = 0;
+		double lateMax = 0;
+		double submitMax = 0;
+		std::printf("\n  %u frames of 33.2 MB, the 9060's read queued before the 3090 writes (copy and direct queue "
+		            "alternately)\n",
+			a_rounds);
+		for (uint32_t round = 1; round <= a_rounds; ++round) {
+			const int which = round & 1;
+			DxQueue& unpack = which ? b.copy : b.direct;
+			*checkCpu = round;
+			a.copy.allocator->Reset();
+			a.copy.list->Reset(a.copy.allocator.Get(), nullptr);
+			a.copy.list->CopyBufferRegion(peerOnA.Get(), 0, src[which].Get(), 0, kLane);
+			a.copy.list->CopyBufferRegion(peerOnA.Get(), kCheckOffset, checkUpload.Get(), 0, sizeof(UINT64));
+			a.copy.list->Close();
+			ID3D12CommandList* listsA[] = { a.copy.list.Get() };
+			a.copy.queue->Wait(gate.Get(), round);
+			a.copy.queue->ExecuteCommandLists(1, listsA);
+			a.copy.queue->Signal(transferA.Get(), round);
+
+			unpack.allocator->Reset();
+			unpack.list->Reset(unpack.allocator.Get(), nullptr);
+			unpack.list->CopyBufferRegion(vramB.Get(), 0, blockB.Get(), 0, kLane);
+			unpack.list->Close();
+			ID3D12CommandList* listsB[] = { unpack.list.Get() };
+			LARGE_INTEGER t0, t1;
+			QueryPerformanceCounter(&t0);
+			unpack.queue->Wait(transferB.Get(), round);
+			unpack.queue->ExecuteCommandLists(1, listsB);
+			unpack.queue->Signal(doneB.Get(), round);
+			QueryPerformanceCounter(&t1);
+			submitMax = (std::max)(submitMax, us(t0, t1));
+
+			std::thread opener([&gate, round] {
+				Sleep(2);
+				gate->Signal(round);
+			});
+			opener.join();
+
+			LARGE_INTEGER s0, s1;
+			QueryPerformanceCounter(&s0);
+			while (transferA->GetCompletedValue() < round) {
+				QueryPerformanceCounter(&s1);
+				if (us(s0, s1) > 2e6) {
+					std::printf("  round %u: the 3090's copy never finished\n", round);
+					return 1;
+				}
+			}
+			QueryPerformanceCounter(&s0);
+			if (*checkGpu != round) {
+				++checkLate;
+				do {
+					QueryPerformanceCounter(&s1);
+				} while (*checkGpu != round && us(s0, s1) < 10000.0);
+				if (*checkGpu != round) ++checkNever;
+				lateMax = (std::max)(lateMax, us(s0, s1));
+			}
+			doneB->SetEventOnCompletion(round, doneEvent);
+			if (WaitForSingleObject(doneEvent, kTimeoutMs) != WAIT_OBJECT_0) {
+				std::printf("  round %u: the 9060's read never finished (removed reason 0x%08lx)\n", round,
+					static_cast<unsigned long>(b.dev->GetDeviceRemovedReason()));
+				return 1;
+			}
+			char what[64];
+			std::snprintf(what, sizeof what, "round %u: 9060 %s queue read the frame", round, which ? "copy" : "direct");
+			if (!b.Verify(b.copy, vramB.Get(), kSeeds[which], what, kLane, true)) ++wrong[which];
+		}
+		CloseHandle(doneEvent);
+		std::printf("  frames with wrong data on the 9060: copy queue %u, direct queue %u, of %u\n", wrong[1], wrong[0],
+			a_rounds);
+		std::printf("  queueing the 9060's wait + read + signal: max %.0f us\n", submitMax);
+		std::printf("  check value not yet visible when the 3090's fence completed: %u of %u frames (max %.1f us late, "
+		            "%u never within 10 ms)\n",
+			checkLate, a_rounds, lateMax, checkNever);
+
+		bool kept = true;
+		if (a_evict) {
+			ComPtr<ID3D12Device1> dev1;
+			b.dev.As(&dev1);
+			ID3D12Pageable* pageable = heapB.Get();
+			auto setPriority = [&](bool a_max) {
+				const D3D12_RESIDENCY_PRIORITY p = a_max ? D3D12_RESIDENCY_PRIORITY_MAXIMUM : D3D12_RESIDENCY_PRIORITY_NORMAL;
+				if (dev1) dev1->SetResidencyPriority(1, &pageable, &p);
+			};
+			std::printf("\n[evict] GPU upload heap; priority via ID3D12Device1::SetResidencyPriority\n");
+			const bool keptDefault = EvictTest(a, b, ptr, setPriority, false);
+			b.Verify(b.copy, blockB.Get(), 0, "page-in read (pattern irrelevant)", kSize, true);
+			const bool keptMax = EvictTest(a, b, ptr, setPriority, true);
+			std::printf("\n  upload heap kept its address under pressure: default priority %s, maximum priority %s\n",
+				keptDefault ? "yes" : "NO", keptMax ? "yes" : "NO");
+			kept = keptDefault && keptMax;
+		}
+		blockB->Unmap(0, nullptr);
+		return (roundsOk && !wrong[0] && !wrong[1] && !checkNever && kept) ? 0 : 1;
+	}
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+	// D3D12 only: handled before anything touches Vulkan.
+	for (int i = 1; i < argc; ++i) {
+		if (std::wcscmp(argv[i], L"--upload-heap") == 0) {
+			bool withEvict = false;
+			uint32_t rounds = 300;
+			for (int j = 1; j < argc; ++j) {
+				if (std::wcscmp(argv[j], L"--evict") == 0) withEvict = true;
+				if (std::wcsncmp(argv[j], L"--rounds=", 9) == 0) rounds = static_cast<uint32_t>(_wtoi(argv[j] + 9));
+			}
+			std::setvbuf(stdout, nullptr, _IONBF, 0);
+			std::printf("p2p-probe --upload-heap: the 3090 writes into a D3D12 GPU upload heap on the 9060, no Vulkan%s\n\n",
+				withEvict ? " (+ VRAM pressure test)" : "");
+			return RunUploadHeap(rounds ? rounds : 300, withEvict);
+		}
+	}
 #ifdef P2P_EXIT_HOOK
 	for (int i = 1; i < argc; ++i) {
 		const bool viaTerminate = std::wcscmp(argv[i], L"--exit-hook-terminate") == 0;

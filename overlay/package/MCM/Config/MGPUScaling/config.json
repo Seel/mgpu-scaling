@@ -309,6 +309,19 @@
 					}
 				},
 				{
+					"id": "iDirectGPUCopyRoute:FrameGeneration",
+					"text": "Direct Copy Route (restart)",
+					"type": "stepper",
+					"help": "How the second GPU holds the VRAM the render GPU writes into. Automatic: D3D12 GPU upload heaps where the second GPU offers them (Windows 11 24H2 or newer with driver support): its own D3D12 reads each frame in place, no Vulkan, no extra copy, half the extra VRAM. Otherwise Vulkan. Vulkan: always the Vulkan route (Windows 10's only one; a small Vulkan device copies each frame into D3D12), for comparing. Requires a game restart. (Default: Automatic)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"Automatic",
+							"Vulkan"
+						]
+					}
+				},
+				{
 					"text": "",
 					"type": "text"
 				},

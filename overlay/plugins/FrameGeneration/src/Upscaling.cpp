@@ -181,6 +181,7 @@ void Upscaling::LoadSettings()
 	settings.fsrFrameGenProvider = std::clamp(static_cast<int>(ini.GetLongValue(section, "iFSRFrameGenProvider", 0)), 0, 1);
 	settings.extraFrameInFlight = ini.GetBoolValue(section, "bExtraFrameInFlight", false);
 	settings.directGpuCopy = ini.GetBoolValue(section, "bDirectGPUCopy", false);
+	settings.directGpuCopyRoute = std::clamp(static_cast<int>(ini.GetLongValue(section, "iDirectGPUCopyRoute", 0)), 0, 1);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
@@ -210,6 +211,9 @@ void Upscaling::LoadSettings()
 		REX::INFO("[Frame Generation] bDirectGPUCopy: {} (second-GPU mode, experimental: the render GPU writes straight into "
 				  "the display GPU's VRAM instead of through system memory)",
 			settings.directGpuCopy);
+		REX::INFO("[Frame Generation] iDirectGPUCopyRoute: {} (0=D3D12 GPU upload heaps when the display GPU offers them, "
+				  "else Vulkan; 1=Vulkan)",
+			settings.directGpuCopyRoute);
 		loggedOnce = true;
 	}
 }

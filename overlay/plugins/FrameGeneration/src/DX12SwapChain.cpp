@@ -63,7 +63,8 @@ void DX12SwapChain::CreateD3D12DevicesSecondaryGPU(IDXGIAdapter* a_gameAdapter, 
 		return fallBack("D3D12CreateDevice on the secondary GPU failed");
 
 	if (!bridge->Initialize(interopDevice.get(), d3d12Device.get(), d3d11Device.get(), d3d11Context.get(),
-			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy))
+			upscaling->settings.asyncUnpack, frameSlots, upscaling->settings.directGpuCopy,
+			upscaling->settings.directGpuCopyRoute == 1))
 		return fallBack("cross-adapter bridge initialisation failed");
 
 	secondaryGPU = true;

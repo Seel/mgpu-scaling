@@ -40,6 +40,7 @@ public:
 		int fsrFrameGenProvider = 0;     ///< SDK 2.4 only: 0 newest offered (4.x ML where available), 1 newest 3.x
 		bool extraFrameInFlight = false; ///< Second-GPU mode: 3 swap-chain buffers instead of 2 (FrameSlots.h); restart
 		bool directGpuCopy = false;      ///< Second-GPU mode: the render GPU writes into the display GPU's VRAM (PeerCopy.h); restart
+		int directGpuCopyRoute = 0;      ///< bDirectGPUCopy's display-GPU side: 0 = D3D12 GPU upload heaps when offered (Win11 24H2+), else Vulkan; 1 = Vulkan; restart
 	};
 
 	Settings settings;

@@ -29,6 +29,7 @@ pwsh -ExecutionPolicy Bypass -File D:\projects\mgpu-scaling\tools\p2p-probe\buil
 | `--evict` | `--interop`, then 19.5 GiB of VRAM pressure on the AMD GPU: does the block move? | reads only across PCIe; the desktop may stutter for a few seconds |
 | `--pipeline [--compute]` | the mod's per-frame sequence 300 times, the AMD side queued before the NVIDIA write; `--compute` uses an async-compute queue as the mod does | P2P writes |
 | `--contention` | the 3090 reads system RAM on its direct queue (bulk 256 KB and tiny 256 B copies, like the game's dynamic buffers) while its copy queue is idle, writes system RAM, or writes the 9060's VRAM | P2P writes |
+| `--upload-heap [--evict] [--rounds=N]` | D3D12 only, no Vulkan (the mod's D3D12 route, Windows 11 24H2+): GPU upload heap support on both GPUs, a 64 MiB GPU upload heap on the 9060 mapped and opened by the 3090, 4 rounds of new data read by the 9060's copy and direct queues and the CPU, speed both ways, then N frames (default 300) of the per-frame sequence with the 9060's read queued before the 3090 writes, alternating its copy and direct queues; `--evict` adds the pressure test on the upload heap | P2P writes; with `--evict` the desktop may stutter for a few seconds |
 | `--exit-hook`, `--exit-hook-terminate` | installs the mod's exit hooks (same detour library, same prologue check) and ends the process through ExitProcess / TerminateProcess: do the hooks fire and pass the exit code on? | none, no GPU work |
 | `--exit-gpu`, `--exit-gpu-terminate` | ends the process while 40 x 64 MiB P2P copies are still running; the hook waits for them, closes the NVIDIA view, then frees the AMD block (the mod's `ReleaseDirectCopyForExit`) | P2P writes; the order that hung the PC is NOT exercised |
 
@@ -38,6 +39,27 @@ with `/MD` because that library is.
 
 Anything unsupported by the root complex could in principle hang or crash Windows; on X299 none
 of it did, and the System log showed no WHEA/PCIe events.
+
+## Measured on Windows 11 (2026-11-09: same PC, Win11 26100+, NVIDIA 32.0.16.2114, AMD 32.0.32015.7029)
+
+`--upload-heap` (log: `upload-heap.log`, `upload-heap-evict.log`): **D3D12 alone does it now.** Both
+GPUs report `GPUUploadHeapSupported = 1`. The 9060 creates a 64 MiB GPU upload heap (type 5) and maps
+it; the 3090 opens the mapping (it sees a custom heap, write-combine, L0, like the Vulkan block). All 4
+rounds correct on the 9060's copy and direct queues and through the CPU mapping.
+
+| 33.2 MB finished frame | ms | GB/s |
+|---|---|---|
+| 3090 copy queue writes the 9060's upload heap | 3.24 | 10.2 |
+| 9060 copy queue reads it into VRAM | 0.41 | 80.9 |
+| 9060 direct queue reads it into VRAM | 0.25 | 131.9 |
+
+300 frames with the 9060's read queued before the 3090 wrote: 0 wrong (copy and direct queue), the
+check value visible through the mapping in all 300 the moment the 3090's fence completed, queueing the
+9060's wait + read + signal at most 248 µs. `--evict`: with 19.5 GiB allocated on the 16 GB card the
+upload heap kept its address at default and at maximum residency priority. (The "page-in read ...
+WRONG" line in that log is expected: that read only pulls the heap back in and is not compared with a
+real pattern.) This is the mod's `iDirectGPUCopyRoute = 0` route: no Vulkan, no landing heap, no
+per-frame Vulkan copy.
 
 ## Measured (2026-11-07: i9-7940X, X299, PCIe 3.0 x16 both, Win10 19045, NVIDIA 591.86, AMD 26.10.1)
 

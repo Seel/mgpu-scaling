@@ -7,6 +7,10 @@
 // CPU address with OpenExistingHeapFromAddress as if it were system memory. Its writes then cross PCIe
 // once, card to card, and never touch system RAM (the cross-adapter heap costs two trips through it).
 //
+// This is the Vulkan route (iDirectGPUCopyRoute = 1, and the automatic choice where the display GPU's
+// D3D12 has no GPU upload heaps). Where it has them (Windows 11 24H2+), CrossAdapterBridge creates the
+// blocks as D3D12 GPU upload heaps itself and this class is not used.
+//
 // On Windows 10, D3D12 cannot create VRAM the CPU can map on a discrete GPU (GPU upload heaps need
 // Windows 11 24H2), and AMD's Vulkan driver does not export CPU-mappable VRAM to D3D12. So this class
 // keeps a small Vulkan device on the display GPU that

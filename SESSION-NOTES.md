@@ -6,6 +6,30 @@ Handoff for a fresh session. Read this first; it assumes no memory of the previo
 > lived in `fo4-fg-gpu1/`. It is now `Seel/mgpu-scaling`, with the same files at the root. Absolute
 > paths below (`D:\fgb`, `D:\fgh`, old `fo4-fg-gpu1\...` references) are kept as written.
 
+## Windows 11 (2026-11-09): bDirectGPUCopy without Vulkan (D3D12 GPU upload heaps)
+
+Planned since 2026-11-07 (see "bDirectGPUCopy built" below: "D3D12 GPU upload heaps need Win11 24H2,
+and the user is on Win10 19045"; PeerCopy.h and the probe README said the same). On Win11 the user
+asked to implement it, keeping Vulkan for Windows 10 users.
+
+- `tools/p2p-probe --upload-heap` (new, D3D12 only): both GPUs `GPUUploadHeapSupported = 1`; the
+  9060's GPU upload heap mapped, the 3090 opens the mapping; 4 rounds correct on the 9060's copy and
+  direct queues and the CPU; 3090 writes 10.2 GB/s (same as the Vulkan block), the 9060 reads 33.2 MB
+  in 0.41 ms (copy queue) / 0.25 ms (direct queue); 300 frames with the 9060's read queued before the
+  3090 wrote, alternating queues: 0 wrong, check value never late; `--evict`: heap kept its address
+  under 19.5 GiB at default and maximum residency priority.
+- Mod: `iDirectGPUCopyRoute` (0 auto, 1 Vulkan). `CrossAdapterBridge::Initialize` checks
+  `D3D12_OPTIONS16.GPUUploadHeapSupported` on B; `CreateUploadHeapBlock` makes each lane's block a
+  `D3D12_HEAP_TYPE_GPU_UPLOAD` heap on B (`SetResidencyPriority` MAXIMUM, placed buffer, persistent
+  Map); A opens it as before; the unpack reads `DirectSourceB(lane)` (the block, or the Vulkan landing
+  heap) and only the Vulkan route queues `QueueDirectCopy`. Guard and exit hooks unchanged (both
+  routes). `ReleaseDirectLanes` releases A's views first, then B's heaps; at exit with the GPUs still
+  busy after 2 s it leaks B's heaps to Windows instead of freeing them (D3D12 does not defer that).
+  Lane fields ordered so a destructor run also closes A's view before the block.
+- Built `/W4 /WX`, 0 warnings. **Works in game** (user, 2026-11-09 00:47-00:49): every frame direct,
+  check values never late, 61-71 game fps → 122-139 presented, submit 0.31 ms (0.40 on the Vulkan
+  route), clean exit. Numbers in NEXT-SESSION.md; no same-spot A/B vs the Vulkan route yet.
+
 ## Windows 11 (2026-11-09): the game crashed at start; GPU roles came out inverted
 
 After the Win10 → Win11 upgrade every start crashed about a second after `[Frame Generation]

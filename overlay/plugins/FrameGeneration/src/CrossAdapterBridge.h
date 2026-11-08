@@ -33,12 +33,17 @@
 //   writes the slot again, so the render GPU never waits on PCIe for the
 //   frame it is working on.
 //
-// Direct GPU copy (bDirectGPUCopy, async unpack only; PeerCopy.h): instead of the cross-adapter
-// heap in system memory, A's copy queue writes each lane straight into a block of B's VRAM (B's
-// Vulkan device maps it through the resizable BAR, A opens the mapping with
-// OpenExistingHeapFromAddress), plus a check value behind the data. On B's copy queue, per lane:
-// Wait(transfer), Signal(landed) -> Vulkan copies the block into a D3D12 landing heap and signals
-// copied -> Wait(copied), then the usual unpack, from the landing heap. One PCIe trip, no system RAM.
+// Direct GPU copy (bDirectGPUCopy, async unpack only): instead of the cross-adapter heap in system
+// memory, A's copy queue writes each lane straight into a block of B's VRAM that is mapped for the CPU
+// through the resizable BAR (A opens the mapping with OpenExistingHeapFromAddress), plus a check value
+// behind the data. One PCIe trip, no system RAM. B's side has two routes:
+//   - D3D12 GPU upload heaps (Windows 11 24H2+, when B's driver offers them; iDirectGPUCopyRoute = 0):
+//     B's D3D12 device creates and maps the block itself, and B's copy queue unpacks straight from it
+//     after Wait(transfer), like the system-memory path. No Vulkan, no landing heap, no extra copy.
+//   - Vulkan (PeerCopy.h; Windows 10, or iDirectGPUCopyRoute = 1): B's D3D12 cannot map VRAM there, so
+//     a Vulkan device on B owns the block. Per lane on B's copy queue: Wait(transfer), Signal(landed) ->
+//     Vulkan copies the block into a D3D12 landing heap and signals copied -> Wait(copied), then the
+//     usual unpack, from the landing heap.
 // The cross-adapter heaps stay allocated. Guard: at every frame start the CPU reads the check values
 // of the copies that finished, through the block's mapping (which follows the block wherever the
 // driver keeps it). A value missing where A wrote it means the block moved: frames go back through
@@ -118,10 +123,11 @@ public:
 	// a_asyncUnpack: unpack on a copy queue of B (true) or on the caller's direct list (false).
 	// a_slots: frames in flight (the FFX swap chain's buffer count), 2 or 3.
 	// a_directCopy: bDirectGPUCopy (needs a_asyncUnpack); falls back to system memory, logged, if it
-	// cannot be set up.
+	// cannot be set up. a_forceVulkan (iDirectGPUCopyRoute = 1): the Vulkan route even where the display
+	// GPU offers D3D12 GPU upload heaps.
 	bool Initialize(ID3D12Device* a_deviceA, ID3D12Device* a_deviceB,
 		ID3D11Device5* a_device11, ID3D11DeviceContext4* a_context11, bool a_asyncUnpack, UINT a_slots,
-		bool a_directCopy);
+		bool a_directCopy, bool a_forceVulkan);
 	[[nodiscard]] UINT SlotCount() const noexcept { return slotCount; }
 
 	// bDirectGPUCopy carries the frames (set up for every lane, guard not tripped).
@@ -271,10 +277,15 @@ private:
 		std::array<winrt::com_ptr<ID3D12Resource>, kSlots> mirrorB;
 		bool mismatchLogged = false;
 
-		// bDirectGPUCopy: B's VRAM block as A sees it, B's landing heap, and the block's CPU mapping.
+		// bDirectGPUCopy: B's VRAM block as A sees it, where B reads the lane, and the block's CPU mapping.
 		// Null/-1 when the lane crosses through system memory only.
+		// D3D12 route: the block is B's own GPU upload heap, read in place. Declared before A's view of it,
+		// so a destructor run closes A's view first, then frees the block (the order that matters at exit).
+		winrt::com_ptr<ID3D12Heap> blockHeapB;
+		winrt::com_ptr<ID3D12Resource> blockB;
 		winrt::com_ptr<ID3D12Heap> peerHeapA;
 		winrt::com_ptr<ID3D12Resource> peerStagingA;
+		// Vulkan route: B's landing heap the Vulkan copy fills (the block itself belongs to PeerCopy).
 		winrt::com_ptr<ID3D12Heap> landingHeapB;
 		winrt::com_ptr<ID3D12Resource> landingB;
 		const volatile std::uint8_t* peerMapped = nullptr;
@@ -358,9 +369,27 @@ private:
 		D3D12_RESOURCE_STATES a_destState, ID3D12Resource* a_source);
 
 	// --- bDirectGPUCopy ---------------------------------------------------------------------
-	// The lane's VRAM block and landing heap (PeerCopy) and A's view of the block. False (logged) when
-	// any of it fails; the caller then turns the direct copy off.
+	enum class DirectRoute
+	{
+		kNone,
+		kUploadHeap,  // B's D3D12 GPU upload heaps, read in place
+		kVulkan,      // PeerCopy: Vulkan block + per-frame copy into a D3D12 landing heap
+	};
+	// The lane's VRAM block (a GPU upload heap, or PeerCopy's block plus a landing heap) and A's view of
+	// the block. False (logged) when any of it fails; the caller then turns the direct copy off.
 	bool AddDirectLane(Lane& a_lane, UINT64 a_heapSize);
+	// D3D12 route: the lane's GPU upload heap on B, mapped. False (logged by the caller) on failure.
+	HRESULT CreateUploadHeapBlock(Lane& a_lane, UINT64 a_heapSize, void*& a_mapped);
+	// Where B's unpack reads a directly copied lane: the block (D3D12 route) or the landing heap (Vulkan).
+	static ID3D12Resource* DirectSourceB(const Lane& a_lane) noexcept
+	{
+		return a_lane.blockB ? a_lane.blockB.get() : a_lane.landingB.get();
+	}
+	// Drops every lane's direct-copy resources: A's views first, then B's side. Only with the GPUs idle
+	// (or before any frame ran); a_leaveBlocksToWindows leaks B's GPU upload heaps instead of releasing
+	// them, for an exit where B may still be reading them.
+	void ReleaseDirectLanes(bool a_leaveBlocksToWindows = false) noexcept;
+	[[nodiscard]] const char* DirectRouteName() const noexcept;
 	// Set-up failure: system memory for the rest of the session, frame generation unaffected.
 	void DisableDirectCopy();
 	// The guard: system memory from the next frame on, frame generation off for the session.
@@ -468,6 +497,7 @@ private:
 	static constexpr UINT64 kCheckStride = 256;  // per lane and slot in the upload buffer; also the space behind the data
 	std::recursive_timed_mutex frameMutex;  // LockFrame / ReleaseDirectCopyForExit
 	bool directCopy = false;         // lanes cross through B's VRAM blocks (all set up, guard not tripped)
+	DirectRoute directRoute = DirectRoute::kNone;  // B's side of it, chosen in Initialize
 	bool directCopyTripped = false;  // the guard tripped this session
 	bool frameDirect = false;        // the path of the frame being assembled, fixed in PrepareFrame
 	UINT64 peerValue = 0;            // PeerCopy::Fence() values: landed/copied, two per lane per frame
