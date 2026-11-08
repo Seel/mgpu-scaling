@@ -1,0 +1,14 @@
+# Reference clones of third-party projects (large, each with its own .git)
+/research/
+
+# Local build log
+build-local.log
+
+# bridge-load build output
+/tools/bridge-load/*.exe
+/tools/bridge-load/*.obj
+
+# p2p-probe build output and run logs
+/tools/p2p-probe/*.exe
+/tools/p2p-probe/*.obj
+/tools/p2p-probe/*.log

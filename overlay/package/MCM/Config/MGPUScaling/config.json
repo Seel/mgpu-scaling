@@ -1,0 +1,415 @@
+{
+	"modName": "MGPUScaling",
+	"displayName": "MGPU Scaling",
+	"minMcmVersion": 2,
+	"pluginRequirements": [],
+	"content": [
+		{
+			"text": "<font size='30'><p align='center'>MGPU SCALING</p></font>",
+			"html": true,
+			"type": "text"
+		},
+		{
+			"text": "ABOUT",
+			"type": "section"
+		},
+		{
+			"text": "Upscaling and frame generation for Fallout 4, with the option to run frame generation and FSR 4.1 upscaling on a second GPU (the one the monitor is plugged into) while the game renders on the first.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "Frame Generation: on/off, FSR runtime and providers. Second GPU: the two-GPU transport. Upscaling: the method and the render resolution.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "Settings marked (restart) take effect after restarting the game. All others apply within about a second.",
+			"type": "text"
+		},
+		{
+			"text": "",
+			"type": "text"
+		},
+		{
+			"text": "This replaces AAAFrameGeneration.dll and Upscaling.dll (FO4Upscaling / FG-GPU1 builds, and doodlum's Upscaling): disable those mods.",
+			"type": "text"
+		}
+	],
+	"pages": [
+		{
+			"pageDisplayName": "Frame Generation",
+			"content": [
+				{
+					"text": "ABOUT",
+					"type": "section"
+				},
+				{
+					"text": "Frame generation inserts interpolated frames between rendered frames, effectively doubling your frame rate.",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "DLSS-G requires an NVIDIA RTX 40-series or newer GPU. 'Second GPU' mode always uses FSR3.",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "Settings marked (restart) take effect after restarting the game. All others apply within about a second.",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "SETTINGS",
+					"type": "section"
+				},
+				{
+					"id": "bFrameGenerationMode:FrameGeneration",
+					"text": "Enable Frame Generation",
+					"type": "switcher",
+					"help": "Toggle frame generation on or off. Takes effect immediately. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "bFrameLimitMode:FrameGeneration",
+					"text": "Frame Rate Limiter",
+					"type": "switcher",
+					"help": "Caps frame rate to your monitor's refresh rate when VSync is disabled. Prevents tearing. Not used when HighFPSPhysicsFix is installed; its own limiter applies instead. Takes effect immediately. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "bDisableInMenus:FrameGeneration",
+					"text": "Disable in Menus",
+					"type": "switcher",
+					"help": "Disables frame generation when menus (Pip-Boy, etc.) are open. Reduces interpolation artifacts in menus but causes a brief hitch on menu open/close. Takes effect immediately. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "iFrameGenType:FrameGeneration",
+					"text": "Backend (restart)",
+					"type": "stepper",
+					"help": "FSR3 works on all GPUs. DLSS-G requires RTX 40+. XeSS-FG works on any modern GPU (best on Intel Arc). Ignored in 'Second GPU' mode, which always uses FSR3. Requires a game restart. (Default: AMD FSR3)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"AMD FSR3",
+							"NVIDIA DLSS-G",
+							"Intel XeSS-FG"
+						]
+					}
+				},
+				{
+					"id": "iFrameGenFrames:FrameGeneration",
+					"text": "Frame Multiplier, DLSS-G (restart)",
+					"type": "stepper",
+					"help": "How many frames to generate per rendered frame. DLSS-G only; FSR3 always generates one. 2x works on RTX 40+. 3x/4x (Multi-Frame Gen) requires RTX 50+. Clamped to hardware max at runtime. Requires a game restart. (Default: 2x)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"2x (1 generated)",
+							"3x (2 generated)",
+							"4x (3 generated)"
+						]
+					}
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "FSR RUNTIME",
+					"type": "section"
+				},
+				{
+					"id": "iFSRRuntime:FrameGeneration",
+					"text": "FSR Runtime (restart)",
+					"type": "stepper",
+					"help": "FSR SDK 2.4 uses the newest FSR frame generation your driver and Windows offer: the 4.0.0 swap chain (driver-assisted frame pacing on RX 9000 with Adrenalin 26.10.1+, VSync off, fullscreen/borderless, inside the VRR range) and FSR 4 ML frame generation where available (Windows 11 + RX 9000), otherwise FSR 3.1.6. The log lists what was offered and used. SDK 1.1.4 is the FSR 3.1.4 runtime this mod was tested with. Requires a game restart. (Default: FSR SDK 2.4)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"FidelityFX SDK 1.1.4 (FSR 3.1.4)",
+							"FSR SDK 2.4 (newest offered)"
+						]
+					}
+				},
+				{
+					"id": "iFSRSwapChainProvider:FrameGeneration",
+					"text": "FSR 2.4 Swap Chain (restart)",
+					"type": "stepper",
+					"help": "FSR SDK 2.4 only. Newest: the newest swap chain offered (4.0.0 on RX 9000, with driver-assisted frame pacing). 3.x: the newest 3.x swap chain (3.1.7), which paces frames itself - for comparing pacing. Requires a game restart. (Default: Newest)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"Newest offered",
+							"3.x only"
+						]
+					}
+				},
+				{
+					"id": "iFSRFrameGenProvider:FrameGeneration",
+					"text": "FSR 2.4 Frame Generation (restart)",
+					"type": "stepper",
+					"help": "FSR SDK 2.4 only. Newest: FSR 4 ML frame generation where offered (Windows 11 + RX 9000), otherwise the newest FSR 3 interpolator (3.1.6). 3.x: always the FSR 3 interpolator - for comparing image quality and cost. Requires a game restart. (Default: Newest)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"Newest offered",
+							"3.x only"
+						]
+					}
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "DEBUG",
+					"type": "section"
+				},
+				{
+					"id": "bEnableDebugLogging:FrameGeneration",
+					"text": "Frame Generation Debug (restart)",
+					"type": "switcher",
+					"help": "Verbose Streamline/XeSS logging (DLSS-G and XeSS-FG only) and FSR 4.1 API checks on the second GPU. Logs go to F4SE/MGPUScaling.log. Requires a game restart. (Default: Off)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				}
+			]
+		},
+		{
+			"pageDisplayName": "Second GPU",
+			"content": [
+				{
+					"text": "SECOND GPU (FG-GPU1)",
+					"type": "section"
+				},
+				{
+					"text": "The game renders on one GPU; FSR3 frame generation and presentation run on the GPU the monitor is plugged into. Every frame's colour, UI-free colour, depth and motion vectors are copied across PCIe.",
+					"type": "text"
+				},
+				{
+					"text": "FSR 4.1 upscaling on that GPU too: Upscaling page > Upscale Method Preference > AMD FSR 4.1 (second GPU), then restart. The game then renders at the quality mode's resolution and the second GPU upscales it before frame generation. Needs FSR Runtime = FSR SDK 2.4.",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"id": "bFrameGenOnSecondaryGPU:FrameGeneration",
+					"text": "Frame Generation on Second GPU (restart)",
+					"type": "switcher",
+					"help": "Run FSR3 frame generation and present on the GPU that drives the monitor, while the game keeps rendering on its own GPU. Not supported with ENB yet. Requires a game restart. (Default: On in this package)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "sSecondaryGPUName:FrameGeneration",
+					"text": "Second GPU Name (restart)",
+					"type": "textinput",
+					"help": "Optional: part of the second GPU's name, e.g. 9060. Leave empty to pick the GPU that drives the monitor the game window is on. Only needed if the log says the choice is ambiguous. Requires a game restart. (Default: empty)",
+					"valueOptions": {
+						"sourceType": "ModSettingString"
+					}
+				},
+				{
+					"id": "bSendHudlessFrame:FrameGeneration",
+					"text": "Send UI-free Frame (restart)",
+					"type": "switcher",
+					"help": "Send an extra, UI-free copy of every frame. On: generated frames keep a clean HUD. Off: about 25% less PCIe traffic, but the HUD is interpolated with the scene and smears during camera movement. Requires a game restart. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "iHalfResDepthMV:FrameGeneration",
+					"text": "Half-resolution Depth / Motion (restart)",
+					"type": "stepper",
+					"help": "Send depth (and optionally motion vectors) at half resolution to save PCIe time. Only generated frames use them; real frames stay full resolution. Depth: rebuilt to full resolution on the second GPU, FSR3 keeps every motion vector (about 2 ms saved at 4K). Depth + motion: FSR3 works at half resolution, like behind 'Performance' upscaling (about 4 ms saved). Requires a game restart. (Default: Depth)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"Off (full resolution)",
+							"Depth",
+							"Depth + motion vectors"
+						]
+					}
+				},
+				{
+					"id": "bAsyncUnpack:FrameGeneration",
+					"text": "Async Unpack (restart)",
+					"type": "switcher",
+					"help": "On: the second GPU reads what arrives on its own copy queue, starting on each buffer as soon as it has crossed PCIe. Off: the original path, which waits for the whole transfer and reads it on the FSR3 queue (for comparison). Requires a game restart. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "bEarlyTransfer:FrameGeneration",
+					"text": "Early Transfer",
+					"type": "switcher",
+					"help": "On: depth and motion vectors start crossing PCIe right after the world pass and the UI-free frame right after its capture; only the finished frame waits for Present. Off: everything crosses at Present (for comparison). Takes effect immediately. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "bEarlyUnpack:FrameGeneration",
+					"text": "Early Unpack",
+					"type": "switcher",
+					"help": "On: the second GPU reads depth, motion vectors and the UI-free frame as soon as they arrive, before Present; afterwards only the finished frame is left to read. Off: all reads start at Present (for comparison). Needs Async Unpack and Early Transfer. Takes effect immediately. (Default: On)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "bExtraFrameInFlight:FrameGeneration",
+					"text": "Extra Frame in Flight (restart)",
+					"type": "switcher",
+					"help": "Three frames in flight instead of two. With two, the game cannot start a frame until the one before the previous is through the whole chain (render GPU, PCIe copy, second GPU, frame generation, pacing) and on screen, so a slow chain lowers the frame rate even when the render GPU has time to spare. With three it waits one frame less often. Costs one frame of input latency. The log line \"render GPU: idle between frames\" shows whether the render GPU is waiting. Requires a game restart. (Default: Off)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"id": "bDirectGPUCopy:FrameGeneration",
+					"text": "Direct GPU-to-GPU Copy (restart, experimental)",
+					"type": "switcher",
+					"help": "The render GPU writes each frame straight into the second GPU's VRAM instead of into system memory for the second GPU to read back: one PCIe trip instead of two, no system RAM traffic. Needs Resizable BAR on the second GPU and Async Unpack. Uses no documented API, so a driver update could break it. A guard checks every frame; if the data ever lands in the wrong place, frames go back through system memory and frame generation turns OFF until you restart (the log says why). Requires a game restart. (Default: Off)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "HDR",
+					"type": "section"
+				},
+				{
+					"text": "HDR add-ons such as ReShade's AutoHDR change the swap chain to 10-bit (HDR10) or 16-bit (scRGB). Frame generation and the second GPU's output follow that format; ReShade then runs after frame generation, on real and generated frames. Change HDR settings only with the game closed.",
+					"type": "text"
+				}
+			]
+		},
+		{
+			"pageDisplayName": "Upscaling",
+			"content": [
+				{
+					"text": "ABOUT",
+					"type": "section"
+				},
+				{
+					"text": "Upscaling reconstructs lower resolutions to the native resolution using advanced algorithms, improving image quality and performance.",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "When ENBSeries is active, only DLAA is available.",
+					"type": "text"
+				},
+				{
+					"text": "",
+					"type": "text"
+				},
+				{
+					"text": "SETTINGS",
+					"type": "section"
+				},
+				{
+					"id": "iUpscaleMethodPreference:Upscaling",
+					"text": "Upscale Method Preference",
+					"type": "stepper",
+					"help": "NVIDIA DLSS 4 is automatically used if available, otherwise AMD FSR 3.1 is used. FSR 4.1 (second GPU) renders here at the quality mode's resolution and upscales on the GPU that runs frame generation (Second GPU page); the game renders natively until that GPU is ready. Changing to or from it, or changing the quality mode while it is on, needs a game restart. (Default: FSR 4.1 (second GPU))",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"Disabled",
+							"AMD FSR 3.1",
+							"NVIDIA DLSS 4",
+							"AMD FSR 4.1 (second GPU)"
+						]
+					}
+				},
+				{
+					"id": "iQualityMode:Upscaling",
+					"text": "Quality Mode",
+					"type": "stepper",
+					"help": "Controls the internal resolution. (Default: Quality)",
+					"valueOptions": {
+						"sourceType": "ModSettingInt",
+						"options": [
+							"Native AA",
+							"Quality",
+							"Balanced",
+							"Performance",
+							"Ultra Performance"
+						]
+					}
+				},
+				{
+					"id": "fSharpness:Upscaling",
+					"text": "Sharpness",
+					"type": "slider",
+					"help": "Post-upscale sharpening via AMD RCAS. Reduces softness from upscaling. (Default: 0.5)",
+					"valueOptions": {
+						"sourceType": "ModSettingFloat",
+						"min": 0.0,
+						"max": 1.0,
+						"step": 0.05
+					}
+				},
+				{
+					"text": "DEBUG",
+					"type": "section"
+				},
+				{
+					"id": "bEnableDebugLogging:Upscaling",
+					"text": "Upscaling Debug Logging (restart)",
+					"type": "switcher",
+					"help": "Verbose diagnostic logging for troubleshooting. Logs go to F4SE/MGPUScaling.log. Requires a game restart. (Default: Off)",
+					"valueOptions": {
+						"sourceType": "ModSettingBool"
+					}
+				}
+			]
+		}
+	]
+}

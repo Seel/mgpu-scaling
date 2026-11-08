@@ -1,0 +1,120 @@
+# Builds MGPU Scaling (AAAMGPUScaling.dll: frame generation and upscaling in one F4SE plugin) from
+# northaxosky/FO4Upscaling (pinned) with the changes in overlay/ copied over it.
+# Output: an artifact "MGPU-Scaling" laid out as a mod (Data\...), ready for Vortex/MO2.
+# Manual only (Actions -> MGPU Scaling -> Run workflow); pushes do not build.
+name: MGPU Scaling
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      UPSTREAM_SHA: 3e237a44269a8dc8cab54aab4ef0aae83c284a43
+
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: mgpu-scaling
+
+      - name: Checkout FO4Upscaling (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: northaxosky/FO4Upscaling
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: FO4Upscaling
+          submodules: recursive
+          lfs: true
+
+      - name: Apply the overlay
+        shell: bash
+        run: |
+          cp -rv mgpu-scaling/overlay/. FO4Upscaling/
+          cd FO4Upscaling
+          git status --short
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'b472291f295551b7127359ea38fdd2ca092f6f1b'
+          vcpkgJsonGlob: 'FO4Upscaling/vcpkg.json'
+
+      - name: Prepare CommonLibF4
+        shell: bash
+        working-directory: FO4Upscaling
+        run: cp cmake/CommonLibF4.cmake.txt extern/CommonLibF4/CMakeLists.txt
+
+      - name: Configure
+        shell: pwsh
+        working-directory: FO4Upscaling
+        run: |
+          # The preset names VS 2022; use whichever Visual Studio the runner image has.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $major = (& $vswhere -latest -property installationVersion).Split('.')[0]
+          $generator = switch ($major) { '18' { 'Visual Studio 18 2026' } default { 'Visual Studio 17 2022' } }
+          Write-Host "Using generator: $generator"
+          cmake -S . --preset=default -G "$generator"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # One DLL: plugins/FrameGeneration/src and plugins/MGPUScaling/src/upscaler.
+      - name: Build MGPUScaling
+        working-directory: FO4Upscaling
+        run: cmake --build build --config Release --target MGPUScaling
+
+      - name: Fetch FidelityFX runtime
+        shell: bash
+        working-directory: FO4Upscaling
+        run: bash scripts/fetch-sdks.sh
+
+      # iFSRRuntime = 1: FSR SDK 2.4 loader + frame-generation + upscaler DLLs, pinned to the v2.4.0 commit
+      # (same files and hashes as build-local.ps1; the release has no binary asset).
+      - name: Fetch FSR SDK 2.4 runtime
+        shell: bash
+        working-directory: FO4Upscaling
+        run: |
+          set -e
+          COMMIT=7539ae8b6568ad29ed78a753404351daf3b5cca7
+          DEST=package/F4SE/Plugins/FrameGeneration/FidelityFX
+          mkdir -p "$DEST"
+          fetch() {
+            curl -fSL "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/$COMMIT/Kits/FidelityFX/signedbin/$1" -o "$DEST/$1"
+            echo "$2  $DEST/$1" | sha256sum -c -
+          }
+          fetch amd_fidelityfx_loader_dx12.dll e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb
+          fetch amd_fidelityfx_framegeneration_dx12.dll e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6
+          fetch amd_fidelityfx_upscaler_dx12.dll aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace
+
+      # Same layout as build-local.ps1: everything under Data/F4SE/Plugins/MGPUScaling and
+      # Data/MCM/Config/MGPUScaling, so no file is shared with doodlum's Upscaling or FO4Upscaling.
+      - name: Package
+        shell: bash
+        run: |
+          SRC=FO4Upscaling
+          FFX="$SRC/package/F4SE/Plugins/FrameGeneration/FidelityFX"
+          OUT=staging/Data
+          DATA="$OUT/F4SE/Plugins/MGPUScaling"
+          mkdir -p "$DATA/Shaders" "$DATA/FidelityFX" "$OUT/MCM/Config/MGPUScaling"
+          cp "$SRC/build/plugins/MGPUScaling/Release/AAAMGPUScaling.dll" "$OUT/F4SE/Plugins/"
+          cp "$SRC/build/plugins/MGPUScaling/Release/AAAMGPUScaling.pdb" "$OUT/F4SE/Plugins/" || true
+          cp "$SRC/package/F4SE/Plugins/FrameGeneration/"*.hlsl "$SRC/package/F4SE/Plugins/Upscaling/"*.hlsl "$DATA/Shaders/"
+          cp "$FFX/amd_fidelityfx_dx12.dll" "$FFX/LICENSE.txt" "$FFX/amd_fidelityfx_loader_dx12.dll" \
+             "$FFX/amd_fidelityfx_framegeneration_dx12.dll" "$FFX/amd_fidelityfx_upscaler_dx12.dll" \
+             "$FFX/LICENSE-FSR-SDK-2.4.txt" "$DATA/FidelityFX/"
+          cp -r "$SRC/package/MCM/Config/MGPUScaling/." "$OUT/MCM/Config/MGPUScaling/"
+          cp "$SRC/COPYING" "$SRC/LICENSE" "$SRC/EXCEPTIONS.md" staging/ 2>/dev/null || true
+          cp mgpu-scaling/README.md staging/MGPU-Scaling-README.md
+          find staging -type f
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: MGPU-Scaling
+          path: staging/

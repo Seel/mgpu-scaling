@@ -1,0 +1,8 @@
+https://github.com/doodlum/fo4test  -  Advanced reverse engineering projects for Fallout 4
+https://github.com/northaxosky/FO4Upscaling  -  Possibly useful to get the needed motion data etc rom Fallout 4
+https://github.com/danielblnc/DLSS-NR-on-AMD   -  DLSS 5 on amd (not sure if source available)
+https://github.com/RedDukeDev/dlss5-nr-amd-custom  -  DLSS 5 on amd
+https://github.com/maohgad-web/Neural-coprocessor  -  DLSS 5 on secondary GPU
+https://github.com/Wehaveall/AMDLSS5  -  Another DLSS5 on amd repo, this one added only for reference, no direct copying.
+https://github.com/northaxosky/fallout4-community-shaders
+https://github.com/MajorPainTheCactus/AutoHDR-ReShade
